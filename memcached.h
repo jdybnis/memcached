@@ -16,6 +16,9 @@
 
 #include "protocol_binary.h"
 
+#define SKIPLIST
+//#define LOCK_FREE
+
 /* Maximum length of a key. */
 #define KEY_MAX_LENGTH 250
 
@@ -62,6 +65,11 @@
 #define CHUNK_ALIGN_BYTES 8
 #define DONT_PREALLOC_SLABS
 #define MAX_NUMBER_OF_SLAB_CLASSES (POWER_LARGEST + 1)
+
+/* Skiplist limits */
+#ifdef SKIPLIST
+#define MAX_SKIPLIST_LEVELS 16
+#endif
 
 /** Time relative to server start. Smaller than time_t on 64-bit systems. */
 typedef unsigned int rel_time_t;
@@ -146,7 +154,12 @@ typedef struct _stritem {
     uint8_t         it_flags;   /* ITEM_* above */
     uint8_t         slabs_clsid;/* which slab class we're in */
     uint8_t         nkey;       /* key length, w/terminating null and padding */
+#ifndef SKIPLIST
     void * end[];
+#else //SKIPLIST
+    uint8_t         levels;     /* number of skiplist levels this item is part of */
+    struct _stritem *s_next[];  /* one pointer for each skiplist level this item is part of */
+#endif//SKIPLIST
     /* if it_flags & ITEM_CAS we have 8 bytes CAS */
     /* then null-terminated key */
     /* then " flags length\r\n" (no terminating null) */
@@ -154,18 +167,24 @@ typedef struct _stritem {
 } item;
 
 /* warning: don't use these macros with a function, as it evals its arg twice */
+#ifndef SKIPLIST
+#define ITEM_end(i) ((i)->end)
+#else //SKIPLIST
+#define ITEM_end(i) ((i)->s_next + (i)->levels)
+#endif//SKIPLIST
+
 #define ITEM_get_cas(i) ((uint64_t)(((i)->it_flags & ITEM_CAS) ? \
-                                    *(uint64_t*)&((i)->end[0]) : 0x0))
+                                    *(uint64_t*)ITEM_end(i) : 0x0))
 #define ITEM_set_cas(i,v) { if ((i)->it_flags & ITEM_CAS) { \
-                          *(uint64_t*)&((i)->end[0]) = v; } }
+                          *(uint64_t*)ITEM_end(i) = v; } }
 
-#define ITEM_key(item) (((char*)&((item)->end[0])) \
+#define ITEM_key(item) ((char*)ITEM_end(item) \
          + (((item)->it_flags & ITEM_CAS) ? sizeof(uint64_t) : 0))
 
-#define ITEM_suffix(item) ((char*) &((item)->end[0]) + (item)->nkey + 1 \
+#define ITEM_suffix(item) ((char*) ITEM_end(item) + (item)->nkey + 1 \
          + (((item)->it_flags & ITEM_CAS) ? sizeof(uint64_t) : 0))
 
-#define ITEM_data(item) ((char*) &((item)->end[0]) + (item)->nkey + 1 \
+#define ITEM_data(item) ((char*) ITEM_end(item) + (item)->nkey + 1 \
          + (item)->nsuffix \
          + (((item)->it_flags & ITEM_CAS) ? sizeof(uint64_t) : 0))
 
@@ -394,3 +413,6 @@ extern void drop_privileges();
 
 #define likely(x)       __builtin_expect((x),1)
 #define unlikely(x)     __builtin_expect((x),0)
+
+#define SYNC_CAS(addr,old,x) __sync_val_compare_and_swap(addr,old,x)
+#define SYNC_ADD(addr,n)     __sync_add_and_fetch(addr,n)

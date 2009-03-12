@@ -36,6 +36,11 @@ static item *tails[LARGEST_ID];
 static itemstats_t itemstats[LARGEST_ID];
 static unsigned int sizes[LARGEST_ID];
 
+#ifdef SKIPLIST
+/* Largest number of skiplist levels of any item that has ever been in the skiplist. */
+int s_high_water = 1;
+#endif//SKIPLIST
+
 void item_init(void) {
     int i;
     memset(itemstats, 0, sizeof(itemstats_t) * LARGEST_ID);
@@ -76,10 +81,14 @@ uint64_t get_cas_id(void) {
  * Returns the total size of the header.
  */
 static size_t item_make_header(const uint8_t nkey, const int flags, const int nbytes,
-                     char *suffix, uint8_t *nsuffix) {
+                     char *suffix, uint8_t *nsuffix, uint8_t levels) {
     /* suffix is defined at 40 chars elsewhere.. */
     *nsuffix = (uint8_t) snprintf(suffix, 40, " %d %d\r\n", flags, nbytes - 2);
+#ifndef SKIPLIST
     return sizeof(item) + nkey + *nsuffix + nbytes;
+#else //SKIPLIST
+    return sizeof(item) + nkey + *nsuffix + nbytes + sizeof(item *) * levels;
+#endif//SKIPLIST
 }
 
 /*@null@*/
@@ -87,7 +96,30 @@ item *do_item_alloc(char *key, const size_t nkey, const int flags, const rel_tim
     uint8_t nsuffix;
     item *it;
     char suffix[40];
-    size_t ntotal = item_make_header(nkey + 1, flags, nbytes, suffix, &nsuffix);
+#ifndef SKIPLIST
+    int levels = 0;
+#else //SKIPLIST
+    /* Pick the number of skiplist levels for this node to be part of. We do this now instead of in assoc_find()
+     * to avoid allocating space in the item for more pointers than we will use.
+     */
+    unsigned r = rand();
+#ifndef __GNUC__
+    int levels = 0;
+    for (int x = 1, n = 0; !(r & x) && n < 32; x += x, ++n) {
+        ++levels;
+    }
+    levels /= 2 + 1;
+#else //__GNUC__
+    int levels = (__builtin_ctz(r) / 2) + 1; /* Count trailing zeros. */
+#endif//__GNUC__
+    if (levels > s_high_water) {
+        levels = ++s_high_water;
+    }
+    if (levels > MAX_SKIPLIST_LEVELS) {
+        levels = MAX_SKIPLIST_LEVELS;
+    }
+#endif//SKIPLIST
+    size_t ntotal = item_make_header(nkey + 1, flags, nbytes, suffix, &nsuffix, levels);
     if (settings.use_cas) {
         ntotal += sizeof(uint64_t);
     }
@@ -148,7 +180,13 @@ item *do_item_alloc(char *key, const size_t nkey, const int flags, const rel_tim
 
     assert(it != heads[it->slabs_clsid]);
 
-    it->next = it->prev = it->h_next = 0;
+#ifndef SKIPLIST
+    it->h_next = 0;
+#else //SKIPLIST
+    it->levels = levels;
+    memset(it->s_next, 0, sizeof(item *) * it->levels);
+#endif//SKIPLIST
+    it->next = it->prev = 0;
     it->refcount = 1;     /* the caller will have a reference */
     DEBUG_REFCNT(it, '*');
     it->it_flags = settings.use_cas ? ITEM_CAS : 0;
@@ -185,8 +223,13 @@ bool item_size_ok(const size_t nkey, const int flags, const int nbytes) {
     char prefix[40];
     uint8_t nsuffix;
 
+#ifndef SKIPLIST
     return slabs_clsid(item_make_header(nkey + 1, flags, nbytes,
-                                        prefix, &nsuffix)) != 0;
+                                        prefix, &nsuffix, 0)) != 0;
+#else
+    return slabs_clsid(item_make_header(nkey + 1, flags, nbytes,
+                                        prefix, &nsuffix, MAX_SKIPLIST_LEVELS)) != 0;
+#endif
 }
 
 static void item_link_q(item *it) { /* item is the new head */
