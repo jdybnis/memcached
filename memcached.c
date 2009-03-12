@@ -45,6 +45,10 @@
 #include <limits.h>
 #include <sysexits.h>
 
+#if defined __GNUC__ && __GNUC__ >= 2
+#include <byteswap.h>
+#endif
+
 /* FreeBSD 4.x doesn't have IOV_MAX exposed. */
 #ifndef IOV_MAX
 #if defined(__FreeBSD__) || defined(__APPLE__)
@@ -1025,6 +1029,9 @@ static void write_bin_response(conn *c, void *d, int hlen, int keylen, int dlen)
 /* Byte swap a 64-bit number */
 static uint64_t swap64(uint64_t in) {
 #ifdef ENDIAN_LITTLE
+#if defined __GNUC__ && __GNUC__ >= 2
+    return bswap_64(in);
+#else
     /* Little endian, flip the bytes around until someone makes a faster/better
     * way to do this. */
     int64_t rv = 0;
@@ -1034,6 +1041,7 @@ static uint64_t swap64(uint64_t in) {
         in >>= 8;
      }
     return rv;
+#endif//!__GNUC__
 #else
     /* big-endian machines don't need byte swapping */
     return in;
