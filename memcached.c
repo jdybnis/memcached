@@ -2426,14 +2426,139 @@ static void process_stat(conn *c, token_t *tokens, const size_t ntokens) {
     out_string(c, "ERROR");
 }
 
+static inline bool process_get_item (conn *c, item *it, int *stats_get_hits, const int stats_get_cmds, const int stats_get_misses, bool return_cas) {
+    char *suffix;
+
+    if (c->ileft == c->isize) {
+        item **new_list = realloc(c->ilist, sizeof(item *) * c->isize * 2);
+        if (new_list) {
+            c->isize *= 2;
+            c->ilist = new_list;
+        } else {
+            item_remove(it);
+            return false;
+        }
+    }
+
+    /*
+     * Construct the response. Each hit adds three elements to the
+     * outgoing data list:
+     *   "VALUE "
+     *   key
+     *   " " + flags + " " + data length + "\r\n" + data (with \r\n)
+     */
+
+    if (return_cas)
+    {
+        MEMCACHED_COMMAND_GET(c->sfd, ITEM_key(it), it->nkey,
+                it->nbytes, ITEM_get_cas(it));
+        /* Goofy mid-flight realloc. */
+        if (c->suffixleft == c->suffixsize) {
+            char **new_suffix_list = realloc(c->suffixlist,
+                    sizeof(char *) * c->suffixsize * 2);
+            if (new_suffix_list) {
+                c->suffixsize *= 2;
+                c->suffixlist  = new_suffix_list;
+            } else {
+                item_remove(it);
+                return false;
+            }
+        }
+
+        suffix = suffix_from_freelist();
+        if (suffix == NULL) {
+            pthread_mutex_lock(&c->thread->stats.mutex);
+            c->thread->stats.get_cmds   += stats_get_cmds;
+            c->thread->stats.get_misses += stats_get_misses;
+            int sid = 0;
+            for(sid = 0; sid < MAX_NUMBER_OF_SLAB_CLASSES; sid++) {
+                c->thread->stats.slab_stats[sid].get_hits += stats_get_hits[sid];
+            }
+            pthread_mutex_unlock(&c->thread->stats.mutex);
+            out_string(c, "SERVER_ERROR out of memory making CAS suffix");
+            item_remove(it);
+            return false;
+        }
+        *(c->suffixlist + c->suffixleft) = suffix;
+        sprintf(suffix, " %llu\r\n", (unsigned long long)ITEM_get_cas(it));
+        if (add_iov(c, "VALUE ", 6) != 0 ||
+                add_iov(c, ITEM_key(it), it->nkey) != 0 ||
+                add_iov(c, ITEM_suffix(it), it->nsuffix - 2) != 0 ||
+                add_iov(c, suffix, strlen(suffix)) != 0 ||
+                add_iov(c, ITEM_data(it), it->nbytes) != 0)
+        {
+            item_remove(it);
+            return false;
+        }
+    }
+    else
+    {
+        MEMCACHED_COMMAND_GET(c->sfd, ITEM_key(it), it->nkey,
+                it->nbytes, ITEM_get_cas(it));
+        if (add_iov(c, "VALUE ", 6) != 0 ||
+                add_iov(c, ITEM_key(it), it->nkey) != 0 ||
+                add_iov(c, ITEM_suffix(it), it->nsuffix + it->nbytes) != 0)
+        {
+            item_remove(it);
+            return false;
+        }
+    }
+
+
+    if (settings.verbose > 1)
+        fprintf(stderr, ">%d sending key %s\n", c->sfd, ITEM_key(it));
+
+    /* item_get() has incremented it->refcount for us */
+    stats_get_hits[it->slabs_clsid]++;
+    item_update(it);
+    *(c->ilist + c->ileft) = it;
+    c->ileft++;
+    if (return_cas) {
+        c->suffixleft++;
+    }
+    return true;
+}
+
+static inline void end_get_command(conn *c, int *stats_get_hits, const int stats_get_cmds, const int stats_get_misses, bool return_cas, bool out_of_memory) {
+    c->icurr = c->ilist;
+    if (return_cas) {
+        c->suffixcurr = c->suffixlist;
+    }
+
+    if (settings.verbose > 1)
+        fprintf(stderr, ">%d END\n", c->sfd);
+
+    /*
+        If the loop was terminated because of out-of-memory, it is not
+        reliable to add END\r\n to the buffer, because it might not end
+        in \r\n. So we send SERVER_ERROR instead.
+    */
+    if (out_of_memory || add_iov(c, "END\r\n", 5) != 0
+        || (IS_UDP(c->protocol) && build_udp_headers(c) != 0)) {
+        out_string(c, "SERVER_ERROR out of memory writing get response");
+    }
+    else {
+        conn_set_state(c, conn_mwrite);
+        c->msgcurr = 0;
+    }
+
+    pthread_mutex_lock(&c->thread->stats.mutex);
+    c->thread->stats.get_cmds   += stats_get_cmds;
+    c->thread->stats.get_misses += stats_get_misses;
+    int sid = 0;
+    for(sid = 0; sid < MAX_NUMBER_OF_SLAB_CLASSES; sid++) {
+        c->thread->stats.slab_stats[sid].get_hits += stats_get_hits[sid];
+    }
+    pthread_mutex_unlock(&c->thread->stats.mutex);
+
+}
+
 /* ntokens is overwritten here... shrug.. */
 static inline void process_get_command(conn *c, token_t *tokens, size_t ntokens, bool return_cas) {
     char *key;
     size_t nkey;
-    int i = 0, sid = 0;
     item *it;
     token_t *key_token = &tokens[KEY_TOKEN];
-    char *suffix;
     int stats_get_cmds   = 0;
     int stats_get_misses = 0;
     int stats_get_hits[MAX_NUMBER_OF_SLAB_CLASSES];
@@ -2451,6 +2576,7 @@ static inline void process_get_command(conn *c, token_t *tokens, size_t ntokens,
                 pthread_mutex_lock(&c->thread->stats.mutex);
                 c->thread->stats.get_cmds   += stats_get_cmds;
                 c->thread->stats.get_misses += stats_get_misses;
+                int sid = 0;
                 for(sid = 0; sid < MAX_NUMBER_OF_SLAB_CLASSES; sid++) {
                     c->thread->stats.slab_stats[sid].get_hits += stats_get_hits[sid];
                 }
@@ -2465,90 +2591,8 @@ static inline void process_get_command(conn *c, token_t *tokens, size_t ntokens,
                 stats_prefix_record_get(key, nkey, NULL != it);
             }
             if (it) {
-                if (i >= c->isize) {
-                    item **new_list = realloc(c->ilist, sizeof(item *) * c->isize * 2);
-                    if (new_list) {
-                        c->isize *= 2;
-                        c->ilist = new_list;
-                    } else {
-                        item_remove(it);
-                        break;
-                    }
-                }
-
-                /*
-                 * Construct the response. Each hit adds three elements to the
-                 * outgoing data list:
-                 *   "VALUE "
-                 *   key
-                 *   " " + flags + " " + data length + "\r\n" + data (with \r\n)
-                 */
-
-                if (return_cas)
-                {
-                  MEMCACHED_COMMAND_GET(c->sfd, ITEM_key(it), it->nkey,
-                                        it->nbytes, ITEM_get_cas(it));
-                  /* Goofy mid-flight realloc. */
-                  if (i >= c->suffixsize) {
-                    char **new_suffix_list = realloc(c->suffixlist,
-                                           sizeof(char *) * c->suffixsize * 2);
-                    if (new_suffix_list) {
-                        c->suffixsize *= 2;
-                        c->suffixlist  = new_suffix_list;
-                    } else {
-                        item_remove(it);
-                        break;
-                    }
-                  }
-
-                  suffix = suffix_from_freelist();
-                  if (suffix == NULL) {
-                    pthread_mutex_lock(&c->thread->stats.mutex);
-                    c->thread->stats.get_cmds   += stats_get_cmds;
-                    c->thread->stats.get_misses += stats_get_misses;
-                    for(sid = 0; sid < MAX_NUMBER_OF_SLAB_CLASSES; sid++) {
-                        c->thread->stats.slab_stats[sid].get_hits += stats_get_hits[sid];
-                    }
-                    pthread_mutex_unlock(&c->thread->stats.mutex);
-                    out_string(c, "SERVER_ERROR out of memory making CAS suffix");
-                    item_remove(it);
-                    return;
-                  }
-                  *(c->suffixlist + i) = suffix;
-                  sprintf(suffix, " %llu\r\n", (unsigned long long)ITEM_get_cas(it));
-                  if (add_iov(c, "VALUE ", 6) != 0 ||
-                      add_iov(c, ITEM_key(it), it->nkey) != 0 ||
-                      add_iov(c, ITEM_suffix(it), it->nsuffix - 2) != 0 ||
-                      add_iov(c, suffix, strlen(suffix)) != 0 ||
-                      add_iov(c, ITEM_data(it), it->nbytes) != 0)
-                      {
-                          item_remove(it);
-                          break;
-                      }
-                }
-                else
-                {
-                  MEMCACHED_COMMAND_GET(c->sfd, ITEM_key(it), it->nkey,
-                                        it->nbytes, ITEM_get_cas(it));
-                  if (add_iov(c, "VALUE ", 6) != 0 ||
-                      add_iov(c, ITEM_key(it), it->nkey) != 0 ||
-                      add_iov(c, ITEM_suffix(it), it->nsuffix + it->nbytes) != 0)
-                      {
-                          item_remove(it);
-                          break;
-                      }
-                }
-
-
-                if (settings.verbose > 1)
-                    fprintf(stderr, ">%d sending key %s\n", c->sfd, ITEM_key(it));
-
-                /* item_get() has incremented it->refcount for us */
-                stats_get_hits[it->slabs_clsid]++;
-                item_update(it);
-                *(c->ilist + i) = it;
-                i++;
-
+                if (!process_get_item(c, it, stats_get_hits, stats_get_cmds, stats_get_misses, return_cas))
+                    break;
             } else {
                 stats_get_misses++;
                 MEMCACHED_COMMAND_GET(c->sfd, key, nkey, -1, 0);
@@ -2568,40 +2612,91 @@ static inline void process_get_command(conn *c, token_t *tokens, size_t ntokens,
 
     } while(key_token->value != NULL);
 
-    c->icurr = c->ilist;
-    c->ileft = i;
-    if (return_cas) {
-        c->suffixcurr = c->suffixlist;
-        c->suffixleft = i;
-    }
-
-    if (settings.verbose > 1)
-        fprintf(stderr, ">%d END\n", c->sfd);
-
-    /*
-        If the loop was terminated because of out-of-memory, it is not
-        reliable to add END\r\n to the buffer, because it might not end
-        in \r\n. So we send SERVER_ERROR instead.
-    */
-    if (key_token->value != NULL || add_iov(c, "END\r\n", 5) != 0
-        || (IS_UDP(c->protocol) && build_udp_headers(c) != 0)) {
-        out_string(c, "SERVER_ERROR out of memory writing get response");
-    }
-    else {
-        conn_set_state(c, conn_mwrite);
-        c->msgcurr = 0;
-    }
-
-    pthread_mutex_lock(&c->thread->stats.mutex);
-    c->thread->stats.get_cmds   += stats_get_cmds;
-    c->thread->stats.get_misses += stats_get_misses;
-    for(sid = 0; sid < MAX_NUMBER_OF_SLAB_CLASSES; sid++) {
-        c->thread->stats.slab_stats[sid].get_hits += stats_get_hits[sid];
-    }
-    pthread_mutex_unlock(&c->thread->stats.mutex);
-
+    end_get_command(c, stats_get_hits, stats_get_cmds, stats_get_misses, return_cas, key_token->value != NULL);
     return;
 }
+
+#ifdef SKIPLIST
+/* rget extension from memcachedb */
+static inline void process_rget_command(conn *c, token_t *tokens, size_t ntokens, bool return_cas) {
+
+    if (settings.evict_to_free) {
+        out_string(c, "ERROR rget command not possible without disabling early eviction (-M option)");
+        return;
+    }
+
+    int stats_get_cmds   = 0;
+    int stats_get_misses = 0;
+    int stats_get_hits[MAX_NUMBER_OF_SLAB_CLASSES];
+    bool out_of_memory = false;
+    assert(c != NULL);
+
+    memset(&stats_get_hits, 0, sizeof(stats_get_hits));
+
+    char *start_key = tokens[1].value;
+    int start_nkey = tokens[1].length;
+    bool start_is_open = (tokens[3].value[0] == '1');
+
+    char *end_key = tokens[2].value;
+    int end_nkey = tokens[2].length;
+    bool end_is_open = (tokens[4].value[0] == '1');
+
+    errno = 0;
+    int max_items = strtoul(tokens[5].value, NULL, 10);
+
+    if(errno != 0 || max_items < 1 || max_items > RGET_MAX_ITEMS ||
+       start_nkey > KEY_MAX_LENGTH || end_nkey > KEY_MAX_LENGTH) {
+        out_string(c, "CLIENT_ERROR bad command line format");
+        return;
+    }
+
+    stats_get_cmds++;
+    item *it = item_rget(start_key, start_nkey);
+    if (it && start_is_open) {
+        int d = memcmp(ITEM_key(it), start_key, (it->nkey < start_nkey) ? it->nkey : start_nkey);
+        if (d == 0 && it->nkey == start_nkey) {
+            item_remove(it);
+            it = item_next(it);
+        }
+    }
+    if (it) {
+        int d = memcmp(ITEM_key(it), end_key, (it->nkey < end_nkey) ? it->nkey : end_nkey);
+        if (d > 0 || (d == 0 && it->nkey == end_nkey && end_is_open)) {
+            item_remove(it);
+            it = NULL;
+        }
+    }
+
+    if (it) {
+        while (it != NULL && c->ileft < max_items) {
+            if (settings.detail_enabled) {
+                stats_prefix_record_get(ITEM_key(it), it->nkey, true);
+            }
+            if (!process_get_item(c, it, stats_get_hits, stats_get_cmds, stats_get_misses, return_cas)) {
+                out_of_memory = true;
+                break;
+            }
+
+            it = item_next(it);
+            if (it) {
+                int d = memcmp(ITEM_key(it), end_key, (it->nkey < end_nkey) ? it->nkey : end_nkey);
+                if (d > 0 || (d == 0 && it->nkey == end_nkey && end_is_open)) {
+                    item_remove(it);
+                    it = NULL;
+                }
+            }
+        }
+    } else {
+        if (settings.detail_enabled) {
+            stats_prefix_record_get(start_key, start_nkey, false);
+        }
+        stats_get_misses++;
+        MEMCACHED_COMMAND_GET(c->sfd, key, nkey, -1, 0);
+    }
+
+    end_get_command(c, stats_get_hits, stats_get_cmds, stats_get_misses, return_cas, out_of_memory);
+}
+#endif
 
 static void process_update_command(conn *c, token_t *tokens, const size_t ntokens, int comm, bool handle_cas) {
     char *key;
@@ -2875,6 +2970,12 @@ static void process_command(conn *c, char *command) {
 
         process_get_command(c, tokens, ntokens, false);
 
+#ifdef SKIPLIST
+    } else if (ntokens == 7 && (strcmp(tokens[COMMAND_TOKEN].value, "rget") == 0)) {
+
+        process_rget_command(c, tokens, ntokens, false);
+
+#endif//SKIPLIST
     } else if ((ntokens == 6 || ntokens == 7) &&
                ((strcmp(tokens[COMMAND_TOKEN].value, "add") == 0 && (comm = NREAD_ADD)) ||
                 (strcmp(tokens[COMMAND_TOKEN].value, "set") == 0 && (comm = NREAD_SET)) ||
@@ -2896,6 +2997,12 @@ static void process_command(conn *c, char *command) {
 
         process_get_command(c, tokens, ntokens, true);
 
+#ifdef SKIPLIST
+    } else if (ntokens == 7 && (strcmp(tokens[COMMAND_TOKEN].value, "rgets") == 0)) {
+
+        process_rget_command(c, tokens, ntokens, true);
+
+#endif//SKIPLIST
     } else if ((ntokens == 4 || ntokens == 5) && (strcmp(tokens[COMMAND_TOKEN].value, "decr") == 0)) {
 
         process_arithmetic_command(c, tokens, ntokens, 0);

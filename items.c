@@ -524,6 +524,43 @@ item *do_item_get_nocheck(const char *key, const size_t nkey) {
     return it;
 }
 
+#ifdef SKIPLIST
+/** wrapper around assoc_find which does the lazy expiration logic */
+item *do_item_rget(const char *key, const size_t nkey) {
+    item *it = assoc_find_next(key, nkey);
+    if (it != NULL && ((settings.oldest_live != 0 && settings.oldest_live <= current_time &&
+        it->time <= settings.oldest_live) || (it->exptime != 0 && it->exptime <= current_time))) {
+        do_item_unlink(it);           /* MTSAFE - cache_lock held */
+        it = do_item_next(it);
+    }
+    if (it != NULL) {
+        it->refcount++;
+        DEBUG_REFCNT(it, '+');
+    }
+    return it;
+}
+
+/** returns the next unexpired item */
+item *do_item_next(item *it) {
+    it = assoc_next(it);
+    do {
+        if (it == NULL)
+            return NULL;
+
+        if ((settings.oldest_live != 0 && settings.oldest_live <= current_time && it->time <= settings.oldest_live) ||
+            (it->exptime != 0 && it->exptime <= current_time)) {
+            item *next = assoc_next(it);
+            do_item_unlink(it);           /* MTSAFE - cache_lock held */
+            it = next;
+            continue;
+        }
+        it->refcount++;
+        DEBUG_REFCNT(it, '+');
+        return it;
+    } while (1);
+}
+#endif//SKIPLIST
+
 /* expires items that are more recent than the oldest_live setting. */
 void do_item_flush_expired(void) {
     int i;

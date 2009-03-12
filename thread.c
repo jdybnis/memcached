@@ -318,6 +318,30 @@ item *item_alloc(char *key, size_t nkey, int flags, rel_time_t exptime, int nbyt
     return it;
 }
 
+#ifdef SKIPLIST
+/*
+ * Returns an item (or on a miss, the subsequent item) if it hasn't been marked as expired,
+ * lazy-expiring as needed.
+ */
+item *item_rget(const char *key, const size_t nkey) {
+    item *it;
+    pthread_mutex_lock(&cache_lock);
+    it = do_item_rget(key, nkey);
+    pthread_mutex_unlock(&cache_lock);
+    return it;
+}
+
+/*
+ * Returns the next item that hasn't been marked as expired
+ */
+item *item_next(item *it) {
+    pthread_mutex_lock(&cache_lock);
+    it = do_item_next(it);
+    pthread_mutex_unlock(&cache_lock);
+    return it;
+}
+#endif//SKIPLIST
+
 /*
  * Returns an item if it hasn't been marked as expired,
  * lazy-expiring as needed.

@@ -381,6 +381,10 @@ item *item_alloc(char *key, size_t nkey, int flags, rel_time_t exptime, int nbyt
 char *item_cachedump(const unsigned int slabs_clsid, const unsigned int limit, unsigned int *bytes);
 void  item_flush_expired(void);
 item *item_get(const char *key, const size_t nkey);
+#ifdef SKIPLIST
+item *item_rget(const char *key, const size_t nkey);
+item *item_next(item *it);
+#endif//SKIPLIST
 int   item_link(item *it);
 void  item_remove(item *it);
 int   item_replace(item *it, item *new_it);

@@ -27,3 +27,7 @@ void do_item_flush_expired(void);
 
 item *do_item_get(const char *key, const size_t nkey);
 item *do_item_get_nocheck(const char *key, const size_t nkey);
+#ifdef SKIPLIST
+item *do_item_rget(const char *key, const size_t nkey);
+item *do_item_next(item *it);
+#endif//SKIPLIST
