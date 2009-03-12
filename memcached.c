@@ -2696,7 +2696,64 @@ static inline void process_rget_command(conn *c, token_t *tokens, size_t ntokens
 
     end_get_command(c, stats_get_hits, stats_get_cmds, stats_get_misses, return_cas, out_of_memory);
 }
-#endif
+
+static inline void process_pget_command(conn *c, token_t *tokens, size_t ntokens, bool return_cas) {
+
+    if (settings.evict_to_free) {
+        out_string(c, "ERROR rget command not possible without disabling early eviction (-M option)");
+        return;
+    }
+
+    int stats_get_cmds   = 0;
+    int stats_get_misses = 0;
+    int stats_get_hits[MAX_NUMBER_OF_SLAB_CLASSES];
+    bool out_of_memory = false;
+
+    char *key = tokens[KEY_TOKEN].value;
+    int nkey = tokens[KEY_TOKEN].length;
+
+    errno = 0;
+    int max_items = strtoul(tokens[2].value, NULL, 10);
+
+    if(errno != 0 || max_items < 1 || max_items > RGET_MAX_ITEMS || nkey > KEY_MAX_LENGTH) {
+        out_string(c, "CLIENT_ERROR bad command line format");
+        return;
+    }
+
+    stats_get_cmds++;
+    item *it = item_rget(key, nkey);
+    if (it && (it->nkey < nkey || (memcmp(ITEM_key(it), key, nkey) != 0))) {
+        item_remove(it);
+        it = NULL;
+    }
+
+    if (it) {
+        while (it != NULL && c->ileft < max_items) {
+            if (settings.detail_enabled) {
+                stats_prefix_record_get(ITEM_key(it), it->nkey, true);
+            }
+            if (!process_get_item(c, it, stats_get_hits, stats_get_cmds, stats_get_misses, return_cas)) {
+                out_of_memory = true;
+                break;
+            }
+
+            it = item_next(it);
+            if (it && (it->nkey < nkey || (memcmp(ITEM_key(it), key, nkey) != 0))) {
+                item_remove(it);
+                break;
+            }
+        }
+    } else {
+        if (settings.detail_enabled) {
+            stats_prefix_record_get(key, nkey, false);
+        }
+        stats_get_misses++;
+        MEMCACHED_COMMAND_GET(c->sfd, key, nkey, -1, 0);
+    }
+
+    end_get_command(c, stats_get_hits, stats_get_cmds, stats_get_misses, return_cas, out_of_memory);
+}
+#endif//SKIPLIST
 
 static void process_update_command(conn *c, token_t *tokens, const size_t ntokens, int comm, bool handle_cas) {
     char *key;
@@ -2883,11 +2940,14 @@ char *do_add_delta(conn *c, item *it, const bool incr, const int64_t delta, char
     return buf;
 }
 
-static void process_delete_command(conn *c, token_t *tokens, const size_t ntokens) {
+static void process_delete_command(conn *c, token_t *tokens, const size_t ntokens, bool prefix) {
     char *key;
     size_t nkey;
     item *it;
 
+#ifndef SKIPLIST
+    assert(prefix == false);
+#endif
     assert(c != NULL);
 
     set_noreply_maybe(c, tokens, ntokens);
@@ -2904,17 +2964,53 @@ static void process_delete_command(conn *c, token_t *tokens, const size_t ntoken
         stats_prefix_record_delete(key, nkey);
     }
 
-    it = item_get(key, nkey);
+    if (prefix) {
+#ifdef SKIPLIST
+        it = item_rget(key, nkey);
+        if (it && (it->nkey < nkey || (memcmp(ITEM_key(it), key, nkey) != 0))) {
+            assert(false);
+            item_remove(it);
+            it = NULL;
+        }
+#endif//SKIPLIST
+    } else {
+        it = item_get(key, nkey);
+    }
     if (it) {
         MEMCACHED_COMMAND_DELETE(c->sfd, ITEM_key(it), it->nkey);
+        int stats_delete_hits = 0;
+        do {
+            stats_delete_hits++;
+            item_unlink(it);
+            if (prefix) {
+#ifdef SKIPLIST
+                item *next = item_next(it);
+                item_remove(it);      /* release our reference */
+                it = next;
+                if (next && (next->nkey < nkey || (memcmp(ITEM_key(next), key, nkey) != 0))) {
+                    item_remove(next);
+                    break;
+                }
+#endif//SKIPLIST
+            } else {
+                item_remove(it);      /* release our reference */
+                break;
+            }
+        } while (it != NULL);
 
         pthread_mutex_lock(&c->thread->stats.mutex);
-        c->thread->stats.slab_stats[it->slabs_clsid].delete_hits++;
+        c->thread->stats.slab_stats[it->slabs_clsid].delete_hits += stats_delete_hits;
         pthread_mutex_unlock(&c->thread->stats.mutex);
 
-        item_unlink(it);
-        item_remove(it);      /* release our reference */
-        out_string(c, "DELETED");
+        if (prefix) {
+#ifdef SKIPLIST
+            char outs[32];
+            snprintf(outs, sizeof(outs), "DELETED %d", stats_delete_hits);
+            out_string(c, outs);
+#endif//SKIPLIST
+        } else {
+            out_string(c, "DELETED");
+        }
     } else {
         pthread_mutex_lock(&c->thread->stats.mutex);
         c->thread->stats.delete_misses++;
@@ -2971,6 +3067,10 @@ static void process_command(conn *c, char *command) {
         process_get_command(c, tokens, ntokens, false);
 
 #ifdef SKIPLIST
+    } else if (ntokens == 4 && (strcmp(tokens[COMMAND_TOKEN].value, "pget") == 0)) {
+
+        process_pget_command(c, tokens, ntokens, false);
+
     } else if (ntokens == 7 && (strcmp(tokens[COMMAND_TOKEN].value, "rget") == 0)) {
 
         process_rget_command(c, tokens, ntokens, false);
@@ -2998,6 +3098,10 @@ static void process_command(conn *c, char *command) {
         process_get_command(c, tokens, ntokens, true);
 
 #ifdef SKIPLIST
+    } else if (ntokens == 4 && (strcmp(tokens[COMMAND_TOKEN].value, "pgets") == 0)) {
+
+        process_pget_command(c, tokens, ntokens, true);
+
     } else if (ntokens == 7 && (strcmp(tokens[COMMAND_TOKEN].value, "rgets") == 0)) {
 
         process_rget_command(c, tokens, ntokens, true);
@@ -3009,8 +3113,14 @@ static void process_command(conn *c, char *command) {
 
     } else if (ntokens >= 3 && ntokens <= 4 && (strcmp(tokens[COMMAND_TOKEN].value, "delete") == 0)) {
 
-        process_delete_command(c, tokens, ntokens);
+        process_delete_command(c, tokens, ntokens, false);
 
+#ifdef SKIPLIST
+    } else if (ntokens >= 3 && ntokens <= 4 && (strcmp(tokens[COMMAND_TOKEN].value, "pdelete") == 0)) {
+
+        process_delete_command(c, tokens, ntokens, true);
+
+#endif//SKIPLIST
     } else if (ntokens >= 2 && (strcmp(tokens[COMMAND_TOKEN].value, "stats") == 0)) {
 
         process_stat(c, tokens, ntokens);
