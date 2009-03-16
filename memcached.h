@@ -68,7 +68,8 @@
 
 /* Skiplist limits */
 #ifdef SKIPLIST
-#define MAX_SKIPLIST_LEVELS 16
+#define MAX_SKIPLIST_LEVELS 24
+#define RGET_MAX_ITEMS 100
 #endif
 
 /** Time relative to server start. Smaller than time_t on 64-bit systems. */
@@ -414,5 +415,7 @@ extern void drop_privileges();
 #define likely(x)       __builtin_expect((x),1)
 #define unlikely(x)     __builtin_expect((x),0)
 
+#ifdef LOCK_FREE
 #define SYNC_CAS(addr,old,x) __sync_val_compare_and_swap(addr,old,x)
 #define SYNC_ADD(addr,n)     __sync_add_and_fetch(addr,n)
+#endif//LOCK_FREE

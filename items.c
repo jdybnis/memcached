@@ -96,29 +96,14 @@ item *do_item_alloc(char *key, const size_t nkey, const int flags, const rel_tim
     uint8_t nsuffix;
     item *it;
     char suffix[40];
-#ifndef SKIPLIST
     int levels = 0;
-#else //SKIPLIST
+#ifdef SKIPLIST
     /* Pick the number of skiplist levels for this node to be part of. We do this now instead of in assoc_find()
      * to avoid allocating space in the item for more pointers than we will use.
      */
-    unsigned r = rand();
-#ifndef __GNUC__
-    int levels = 0;
-    for (int x = 1, n = 0; !(r & x) && n < 32; x += x, ++n) {
-        ++levels;
-    }
-    levels /= 2 + 1;
-#else //__GNUC__
-    int levels = (__builtin_ctz(r) / 2) + 1; /* Count trailing zeros. */
-#endif//__GNUC__
-    if (levels > s_high_water) {
-        levels = ++s_high_water;
-    }
-    if (levels > MAX_SKIPLIST_LEVELS) {
-        levels = MAX_SKIPLIST_LEVELS;
-    }
-#endif//SKIPLIST
+    levels = assoc_pick_random_levels();
+#endif
+
     size_t ntotal = item_make_header(nkey + 1, flags, nbytes, suffix, &nsuffix, levels);
     if (settings.use_cas) {
         ntotal += sizeof(uint64_t);

@@ -64,11 +64,11 @@ static unsigned int expand_bucket = 0;
 
 #else //SKIPLIST
 
- #ifdef LOCK_FREE
- #define  MARK_ITEM(x) (item *)((size_t)(x) | 0x1)
- #define   HAS_MARK(x) (((size_t)(x) & 0x1) == 0x1)
- #define STRIP_MARK(x) ((item *)((size_t)(x) & ~(size_t)0x1))
- #endif//LOCK_FREE
+#ifdef LOCK_FREE
+#define  MARK_ITEM(x) (item *)((size_t)(x) | 0x1)
+#define   HAS_MARK(x) (((size_t)(x) & 0x1) == 0x1)
+#define STRIP_MARK(x) ((item *)((size_t)(x) & ~(size_t)0x1))
+#endif//LOCK_FREE
 
 enum unlink {
     force_unlink,
@@ -80,11 +80,12 @@ enum unlink {
 static item *skiplist = NULL;
 
 /* Largest number of skiplist levels of any item that has ever been in the skiplist. */
-extern int s_high_water;
+static int s_high_water = 1;
+uint32_t rand_x = 123456789, rand_y = 362436000, rand_z = 521288629, rand_c = 7654321;
 
 #ifdef ENABLE_DTRACE
 static unsigned int skiplist_items = 0;
-#endif
+#endif//ENABLE_DTRACE
 #endif//SKIPLIST
 
 void assoc_init(void) {
@@ -107,6 +108,38 @@ void assoc_init(void) {
 }
 
 #ifdef SKIPLIST
+int assoc_pick_random_levels(void) {
+
+    /* George Marsaglia's KISS generator */
+    rand_x = 69069 * rand_x + 12345;
+    rand_y ^= (rand_y << 13);
+    rand_y ^= (rand_y >> 17);
+    rand_y ^= (rand_y <<  5);
+    uint64_t t = 698769069LL * rand_z + rand_c;
+    rand_c = t >> 32;
+    uint64_t r = rand_x + rand_y + (rand_z = t);
+
+#ifndef __GNUC__
+    int zeros = 0;
+    for (int m = 1, n = 0; !(r & m) && n < 64; m += m, ++n) {
+        ++zeros;
+    }
+#else //__GNUC__
+    int zeros = __builtin_ctz(r); /* count trailing zeros */
+#endif//__GNUC__
+
+    int levels = (int)(zeros / 1.5);
+    if (levels == 0)
+        return 1;
+    if (levels > s_high_water) {
+        levels = ++s_high_water;
+    }
+    if (levels > MAX_SKIPLIST_LEVELS) {
+        levels = MAX_SKIPLIST_LEVELS;
+    }
+    return levels;
+}
+
 static item *find_preds (item **preds, item **succs, int n, const char *key, const size_t nkey, enum unlink unlink) {
     assert(n == 0 || unlink != force_unlink);
     item *pred = skiplist;
@@ -187,7 +220,6 @@ static item *find_preds (item **preds, item **succs, int n, const char *key, con
 
 item *assoc_find_next(const char *key, const size_t nkey) {
     item *next;
-    assert(s_high_water >= 1);
     item *ret = find_preds(NULL, &next, 1, key, nkey, dont_unlink);
     if (ret == NULL) {
 #ifdef LOCK_FREE
