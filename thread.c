@@ -452,29 +452,19 @@ char *item_cachedump(unsigned int slabs_clsid, unsigned int limit, unsigned int 
 /*
  * Dumps statistics about slab classes
  */
-char *item_stats(uint32_t (*add_stats)(char *buf, const char *key,
-                 const uint16_t klen, const char *val, const uint32_t vlen,
-                 void *cookie), void *c, int *bytes) {
-    char *ret;
-
+void  item_stats(ADD_STAT add_stats, void *c) {
     pthread_mutex_lock(&cache_lock);
-    ret = do_item_stats(add_stats, c, bytes);
+    do_item_stats(add_stats, c);
     pthread_mutex_unlock(&cache_lock);
-    return ret;
 }
 
 /*
  * Dumps a list of objects of each size in 32-byte increments
  */
-char *item_stats_sizes(uint32_t (*add_stats)(char *buf,
-                       const char *key, const uint16_t klen, const char *val,
-                       const uint32_t vlen, void *cookie), void *c, int *bytes) {
-    char *ret;
-
+void  item_stats_sizes(ADD_STAT add_stats, void *c) {
     pthread_mutex_lock(&cache_lock);
-    ret = do_item_stats_sizes(add_stats, c, bytes);
+    do_item_stats_sizes(add_stats, c);
     pthread_mutex_unlock(&cache_lock);
-    return ret;
 }
 
 /******************************* GLOBAL STATS ******************************/
@@ -497,8 +487,10 @@ void threadlocal_stats_reset(void) {
         threads[ii].stats.delete_misses = 0;
         threads[ii].stats.incr_misses = 0;
         threads[ii].stats.decr_misses = 0;
+        threads[ii].stats.cas_misses = 0;
         threads[ii].stats.bytes_read = 0;
         threads[ii].stats.bytes_written = 0;
+        threads[ii].stats.flush_cmds = 0;
 
         for(sid = 0; sid < MAX_NUMBER_OF_SLAB_CLASSES; sid++) {
             threads[ii].stats.slab_stats[sid].set_cmds = 0;
@@ -506,6 +498,8 @@ void threadlocal_stats_reset(void) {
             threads[ii].stats.slab_stats[sid].delete_hits = 0;
             threads[ii].stats.slab_stats[sid].incr_hits = 0;
             threads[ii].stats.slab_stats[sid].decr_hits = 0;
+            threads[ii].stats.slab_stats[sid].cas_hits = 0;
+            threads[ii].stats.slab_stats[sid].cas_badval = 0;
         }
 
         pthread_mutex_unlock(&threads[ii].stats.mutex);
@@ -523,6 +517,7 @@ void threadlocal_stats_aggregate(struct thread_stats *stats) {
     stats->cas_misses = 0;
     stats->bytes_written = 0;
     stats->bytes_read = 0;
+    stats->flush_cmds = 0;
 
     memset(stats->slab_stats, 0,
            sizeof(struct slab_stats) * MAX_NUMBER_OF_SLAB_CLASSES);
@@ -538,6 +533,7 @@ void threadlocal_stats_aggregate(struct thread_stats *stats) {
         stats->cas_misses += threads[ii].stats.cas_misses;
         stats->bytes_read += threads[ii].stats.bytes_read;
         stats->bytes_written += threads[ii].stats.bytes_written;
+        stats->flush_cmds += threads[ii].stats.flush_cmds;
 
         for (sid = 0; sid < MAX_NUMBER_OF_SLAB_CLASSES; sid++) {
             stats->slab_stats[sid].set_cmds +=

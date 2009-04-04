@@ -1,5 +1,6 @@
 AC_PREREQ(2.52)
-AC_INIT(memcached, 1.3.2, brad@danga.com)
+m4_include([version.m4])
+AC_INIT(memcached, VERSION_NUMBER, brad@danga.com)
 AC_CANONICAL_SYSTEM
 AC_CONFIG_SRCDIR(memcached.c)
 AM_INIT_AUTOMAKE(AC_PACKAGE_NAME, AC_PACKAGE_VERSION)
@@ -83,6 +84,10 @@ if test "x$enable_dtrace" == "xyes"; then
     then
         dtrace_instrument_obj=yes
         rm conftest.$$
+    fi
+
+    if test "`which tr`" = "/usr/ucb/tr"; then
+        AC_MSG_ERROR([Please remove /usr/ucb from your path. See man standards for more info])
     fi
   else
     AC_MSG_ERROR([Need dtrace binary and OS support.])

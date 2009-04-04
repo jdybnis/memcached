@@ -21,6 +21,7 @@
 #include <sys/resource.h>
 #include <sys/uio.h>
 #include <ctype.h>
+#include <stdarg.h>
 
 /* some POSIX systems need the following definition
  * to get mlockall flags out of sys/mman.h.  */
@@ -63,16 +64,24 @@ static void drive_machine(conn *c);
 static int new_socket(struct addrinfo *ai);
 static int server_socket(const int port, enum protocol prot);
 static int try_read_command(conn *c);
-static int try_read_network(conn *c);
-static int try_read_udp(conn *c);
+
+enum try_read_result {
+    READ_DATA_RECEIVED,
+    READ_NO_DATA_RECEIVED,
+    READ_ERROR,            /** an error occured (on the socket) (or client closed connection) */
+    READ_MEMORY_ERROR      /** failed to allocate more memory */
+};
+
+static enum try_read_result try_read_network(conn *c);
+static enum try_read_result try_read_udp(conn *c);
+
 static void conn_set_state(conn *c, enum conn_states state);
 
 /* stats */
 static void stats_init(void);
-static char *server_stats(uint32_t (*add_stats)(char *buf, const char *key,
-                          const uint16_t klen, const char *val,
-                          const uint32_t vlen, void *cookie), conn *c,
-                          int *buflen);
+static void server_stats(ADD_STAT add_stats, conn *c);
+static void process_stat_settings(ADD_STAT add_stats, void *c);
+
 
 /* defaults */
 static void settings_init(void);
@@ -86,7 +95,6 @@ static bool update_event(conn *c, const int new_flags);
 static void complete_nread(conn *c);
 static void process_command(conn *c, char *command);
 static void write_and_free(conn *c, char *buf, int bytes);
-static int transmit(conn *c);
 static int ensure_iov_space(conn *c);
 static int add_iov(conn *c, const void *buf, int len);
 static int add_msghdr(conn *c);
@@ -108,10 +116,14 @@ time_t process_started;     /* when the process was started */
 static conn *listen_conn = NULL;
 static struct event_base *main_base;
 
-#define TRANSMIT_COMPLETE   0
-#define TRANSMIT_INCOMPLETE 1
-#define TRANSMIT_SOFT_ERROR 2
-#define TRANSMIT_HARD_ERROR 3
+enum transmit_result {
+    TRANSMIT_COMPLETE,   /** All done writing. */
+    TRANSMIT_INCOMPLETE, /** More data remaining to write. */
+    TRANSMIT_SOFT_ERROR, /** Can't write any more right now. */
+    TRANSMIT_HARD_ERROR  /** Can't write (c->state is set to conn_closing) */
+};
+
+static enum transmit_result transmit(conn *c);
 
 #define REALTIME_MAXDELTA 60*60*24*30
 
@@ -142,8 +154,9 @@ static rel_time_t realtime(const time_t exptime) {
 
 static void stats_init(void) {
     stats.curr_items = stats.total_items = stats.curr_conns = stats.total_conns = stats.conn_structs = 0;
-    stats.evictions = 0;
-    stats.curr_bytes = 0;
+    stats.get_cmds = stats.set_cmds = stats.get_hits = stats.get_misses = stats.evictions = 0;
+    stats.curr_bytes = stats.listen_disabled_num = 0;
+    stats.accepting_conns = true; /* assuming we start in this state. */
 
     /* make the time we started always be 2 seconds before we really
        did, so time(0) - time.started is never zero.  if so, things
@@ -157,9 +170,11 @@ static void stats_reset(void) {
     STATS_LOCK();
     stats.total_items = stats.total_conns = 0;
     stats.evictions = 0;
+    stats.listen_disabled_num = 0;
     stats_prefix_clear();
     STATS_UNLOCK();
     threadlocal_stats_reset();
+    item_stats_reset();
 }
 
 static void settings_init(void) {
@@ -181,6 +196,7 @@ static void settings_init(void) {
     settings.prefix_delimiter = ':';
     settings.detail_enabled = 0;
     settings.reqs_per_event = 20;
+    settings.backlog = 1024;
 }
 
 /*
@@ -1280,9 +1296,10 @@ static void process_bin_get(conn *c) {
     }
 }
 
-uint32_t append_bin_stats(char *buf, const char *key, const uint16_t klen,
-                          const char *val, const uint32_t vlen, void *cookie) {
-    conn *c = (conn *)cookie;
+static void append_bin_stats(const char *key, const uint16_t klen,
+                             const char *val, const uint32_t vlen,
+                             conn *c) {
+    char *buf = c->stats.buffer + c->stats.offset;
     uint32_t bodylen = klen + vlen;
     protocol_binary_response_header header = {
         .response.magic = (uint8_t)PROTOCOL_BINARY_RES,
@@ -1305,13 +1322,81 @@ uint32_t append_bin_stats(char *buf, const char *key, const uint16_t klen,
         }
     }
 
-    return sizeof(header.response) + bodylen;
+    c->stats.offset += sizeof(header.response) + bodylen;
+}
+
+static void append_ascii_stats(const char *key, const uint16_t klen,
+                               const char *val, const uint32_t vlen,
+                               conn *c) {
+    char *pos = c->stats.buffer + c->stats.offset;
+    uint32_t nbytes;
+
+    if (klen == 0 && vlen == 0) {
+        nbytes = sprintf(pos, "END\r\n");
+    } else if (vlen == 0) {
+        nbytes = sprintf(pos, "STAT %s\r\n", key);
+    } else {
+        nbytes = sprintf(pos, "STAT %s %s\r\n", key, val);
+    }
+
+    c->stats.offset += nbytes;
+}
+
+static bool grow_stats_buf(conn *c, size_t needed) {
+    size_t size = c->stats.size - c->stats.offset;
+    size_t nsize = size;
+    bool rv = true;
+
+    while (nsize < needed) {
+        nsize = nsize << 1;
+    }
+
+    if (nsize > size) {
+        char *ptr = realloc(c->stats.buffer, nsize);
+        if (ptr) {
+            c->stats.buffer = ptr;
+            c->stats.size = nsize;
+        } else {
+            rv = false;
+        }
+    }
+
+    return rv;
+}
+
+static void append_stats(const char *key, const uint16_t klen,
+                  const char *val, const uint32_t vlen,
+                  const void *cookie)
+{
+    /* value without a key is invalid */
+    if (klen == 0 && vlen > 0) {
+        return ;
+    }
+
+    conn *c = (conn*)cookie;
+    if (c->stats.buffer == NULL) {
+        c->stats.buffer = malloc(2048);
+        c->stats.size = 2048;
+        c->stats.offset = 0;
+    }
+
+    if (c->protocol == binary_prot) {
+        size_t needed = vlen + klen + sizeof(protocol_binary_response_header);
+        if (!grow_stats_buf(c, needed)) {
+            return ;
+        }
+        append_bin_stats(key, klen, val, vlen, c);
+    } else {
+        size_t needed = vlen + klen + 10; // 10 == "STAT = \r\n"
+        if (!grow_stats_buf(c, needed)) {
+            return ;
+        }
+        append_ascii_stats(key, klen, val, vlen, c);
+    }
 }
 
 static void process_bin_stat(conn *c) {
-    protocol_binary_response_header *header;
     char *subcommand = binary_get_key(c);
-    char *buf;
     size_t nkey = c->binary_header.request.keylen;
 
     if (settings.verbose) {
@@ -1324,125 +1409,55 @@ static void process_bin_stat(conn *c) {
     }
 
     if (nkey == 0) {
-        int server_statlen, engine_statlen;
-        char *ptr, *server_statbuf, *engine_statbuf;
-
-        if ((server_statbuf = server_stats(&append_bin_stats, (void *)c,
-                                           &server_statlen)) == NULL) {
-            write_bin_error(c, PROTOCOL_BINARY_RESPONSE_ENOMEM, 0);
-            return;
-        }
-
-        if ((engine_statbuf = get_stats(NULL, 0, &append_bin_stats, (void *)c,
-                                        &engine_statlen)) == NULL) {
-            free(server_statbuf);
-            write_bin_error(c, PROTOCOL_BINARY_RESPONSE_ENOMEM, 0);
-            return;
-        }
-
-        buf = malloc(server_statlen + engine_statlen + sizeof(header->response));
-
-        if (buf == NULL) {
-            free(server_statbuf);
-            free(engine_statbuf);
-            write_bin_error(c, PROTOCOL_BINARY_RESPONSE_ENOMEM, 0);
-            return;
-        }
-
-        ptr = buf;
-
-        memcpy(ptr, server_statbuf, server_statlen);
-        ptr += server_statlen;
-        memcpy(ptr, engine_statbuf, engine_statlen);
-        ptr += engine_statlen;
-
-        /* append termination packet */
-        append_bin_stats(ptr, NULL, 0, NULL, 0, (void *)c);
-
-        free(server_statbuf);
-        free(engine_statbuf);
-        write_and_free(c, buf, server_statlen + engine_statlen + sizeof(header->response));
+        /* request all statistics */
+        server_stats(&append_stats, c);
+        (void)get_stats(NULL, 0, &append_stats, c);
     } else if (strncmp(subcommand, "reset", 5) == 0) {
-        buf = malloc(sizeof(header->response));
-
-        if (buf == NULL) {
-            write_bin_error(c, PROTOCOL_BINARY_RESPONSE_ENOMEM, 0);
-            return;
-        }
-
         stats_reset();
-
-        append_bin_stats(buf, NULL, 0, NULL, 0, (void *)c);
-        write_and_free(c, buf, sizeof(header->response));
+    } else if (strncmp(subcommand, "settings", 8) == 0) {
+        process_stat_settings(&append_stats, c);
     } else if (strncmp(subcommand, "detail", 6) == 0) {
         char *subcmd_pos = subcommand + 6;
-        char *bufpos;
-        int len = 0;
-
         if (strncmp(subcmd_pos, " dump", 5) == 0) {
+            int len;
             char *dump_buf = stats_prefix_dump(&len);
-            int nbytes = 0;
-            int allocation = 0;
-
             if (dump_buf == NULL || len <= 0) {
                 write_bin_error(c, PROTOCOL_BINARY_RESPONSE_ENOMEM, 0);
-                return;
-            }
-
-            /* Extra 9 bytes for (length "detailed") */
-            allocation = (sizeof(header->response) * 2) + len + 8;
-            buf = malloc(allocation);
-
-            if (buf == NULL) {
+                return ;
+            } else {
+                append_stats("detailed", strlen("detailed"), dump_buf, len, c);
                 free(dump_buf);
-                write_bin_error(c, PROTOCOL_BINARY_RESPONSE_ENOMEM, 0);
-                return;
             }
-
-            bufpos = buf;
-
-            nbytes = append_bin_stats(bufpos, "detailed", strlen("detailed"),
-                                      dump_buf, len, (void *)c);
-            bufpos += nbytes;
-            nbytes += append_bin_stats(bufpos, NULL, 0, NULL, 0, (void *)c);
-            assert(nbytes <= allocation);
-            free(dump_buf);
-
-            write_and_free(c, buf, nbytes);
-            return;
-        }
-
-        if ((buf = malloc(sizeof(header->response))) == NULL) {
-            write_bin_error(c, PROTOCOL_BINARY_RESPONSE_ENOMEM, 0);
-            return;
-        }
-
-        bufpos = buf;
-
-        if (strncmp(subcmd_pos, " on", 3) == 0) {
+        } else if (strncmp(subcmd_pos, " on", 3) == 0) {
             settings.detail_enabled = 1;
         } else if (strncmp(subcmd_pos, " off", 4) == 0) {
             settings.detail_enabled = 0;
         } else {
-            free(buf);
             write_bin_error(c, PROTOCOL_BINARY_RESPONSE_KEY_ENOENT, 0);
             return;
         }
-
-        len = append_bin_stats(bufpos, NULL, 0, NULL, 0, (void *)c);
-        write_and_free(c, buf, len);
-        return;
     } else {
-        int len = 0;
-        buf = get_stats(subcommand, nkey, &append_bin_stats, (void *)c, &len);
-
-        /* len is set to -1 in get_stats if memory couldn't be allocated */
-        if (len < 0)
-            write_bin_error(c, PROTOCOL_BINARY_RESPONSE_ENOMEM, 0);
-        else if (buf == NULL)
+        if (get_stats(subcommand, nkey, &append_stats, c)) {
+            if (c->stats.buffer == NULL) {
+                write_bin_error(c, PROTOCOL_BINARY_RESPONSE_ENOMEM, 0);
+            } else {
+                write_and_free(c, c->stats.buffer, c->stats.offset);
+                c->stats.buffer = NULL;
+            }
+        } else {
             write_bin_error(c, PROTOCOL_BINARY_RESPONSE_KEY_ENOENT, 0);
-        else
-            write_and_free(c, buf, len);
+        }
+
+        return;
+    }
+
+    /* Append termination package and start the transfer */
+    append_stats(NULL, 0, NULL, 0, c);
+    if (c->stats.buffer == NULL) {
+        write_bin_error(c, PROTOCOL_BINARY_RESPONSE_ENOMEM, 0);
+    } else {
+        write_and_free(c, c->stats.buffer, c->stats.offset);
+        c->stats.buffer = NULL;
     }
 }
 
@@ -1850,9 +1865,11 @@ static void reset_cmd_handler(conn *c) {
 
 static void complete_nread(conn *c) {
     assert(c != NULL);
-    assert(c->protocol == ascii_prot || c->protocol == binary_prot);
+    assert(c->protocol == ascii_udp_prot
+           || c->protocol == ascii_prot
+           || c->protocol == binary_prot);
 
-    if (c->protocol == ascii_prot) {
+    if (c->protocol == ascii_prot || c->protocol == ascii_udp_prot) {
         complete_nread_ascii(c);
     } else if (c->protocol == binary_prot) {
         complete_nread_binary(c);
@@ -2074,6 +2091,24 @@ static inline void set_noreply_maybe(conn *c, token_t *tokens, size_t ntokens)
     }
 }
 
+void append_stat(const char *name, ADD_STAT add_stats, conn *c,
+                 const char *fmt, ...) {
+    char val_str[128];
+    int vlen;
+    va_list ap;
+
+    assert(name);
+    assert(add_stats);
+    assert(c);
+    assert(fmt);
+
+    va_start(ap, fmt);
+    vlen = vsnprintf(val_str, sizeof(val_str) - 1, fmt, ap);
+    va_end(ap);
+
+    add_stats(name, strlen(name), val_str, vlen, c);
+}
+
 inline static void process_stats_detail(conn *c, const char *command) {
     assert(c != NULL);
 
@@ -2096,19 +2131,9 @@ inline static void process_stats_detail(conn *c, const char *command) {
 }
 
 /* return server specific stats only */
-static char *server_stats(uint32_t (*add_stats)(char *buf, const char *key,
-                          const uint16_t klen, const char *val,
-                          const uint32_t vlen, void *cookie), conn *c,
-                          int *buflen) {
-    char temp[2048];
-    char val[128];
-    char *buf = NULL;
-    char *pos = temp;
-    size_t nbytes;
-    int vlen = 0;
+static void server_stats(ADD_STAT add_stats, conn *c) {
     pid_t pid = getpid();
     rel_time_t now = current_time;
-    *buflen = 0;
 
     struct thread_stats thread_stats;
     threadlocal_stats_aggregate(&thread_stats);
@@ -2121,275 +2146,99 @@ static char *server_stats(uint32_t (*add_stats)(char *buf, const char *key,
 #endif /* !WIN32 */
 
     STATS_LOCK();
-    memset(val, 0, 128);
 
-    vlen = sprintf(val, "%lu", (long)pid);
-    nbytes = add_stats(pos, "pid", strlen("pid"), val, vlen, (void *)c);
-    pos += nbytes;
-    *buflen += nbytes;
-
-    vlen = sprintf(val, "%u", now);
-    nbytes = add_stats(pos, "uptime", strlen("uptime"), val, vlen, (void *)c);
-    pos += nbytes;
-    *buflen += nbytes;
-
-    vlen = sprintf(val, "%ld", now + (long)process_started);
-    nbytes = add_stats(pos, "time", strlen("time"), val, vlen, (void *)c);
-    pos += nbytes;
-    *buflen += nbytes;
-
-    nbytes = add_stats(pos, "version", strlen("version"), VERSION,
-                       strlen(VERSION), (void *)c);
-    pos += nbytes;
-    *buflen += nbytes;
-
-    vlen = sprintf(val, "%d", (int)(8 * sizeof(void *)));
-    nbytes = add_stats(pos, "pointer_size", strlen("pointer_size"), val, vlen,
-                       (void *)c);
-    pos += nbytes;
-    *buflen += nbytes;
+    APPEND_STAT("pid", "%lu", (long)pid);
+    APPEND_STAT("uptime", "%u", now);
+    APPEND_STAT("time", "%ld", now + (long)process_started);
+    APPEND_STAT("version", "%s", VERSION);
+    APPEND_STAT("pointer_size", "%d", (int)(8 * sizeof(void *)));
 
 #ifndef WIN32
-    vlen = sprintf(val, "%ld.%06ld", (long)usage.ru_utime.tv_sec,
-                   (long)usage.ru_utime.tv_usec);
-    nbytes = add_stats(pos, "rusage_user", strlen("rusage_user"), val, vlen,
-                       (void *)c);
-    pos += nbytes;
-    *buflen += nbytes;
-
-    vlen = sprintf(val, "%ld.%06ld", (long)usage.ru_stime.tv_sec,
-                   (long)usage.ru_stime.tv_usec);
-    nbytes = add_stats(pos, "rusage_system", strlen("rusage_system"), val,
-                       vlen, (void *)c);
-    pos += nbytes;
-    *buflen += nbytes;
+    append_stat("rusage_user", add_stats, c, "%ld.%06ld",
+                (long)usage.ru_utime.tv_sec,
+                (long)usage.ru_utime.tv_usec);
+    append_stat("rusage_system", add_stats, c, "%ld.%06ld",
+                (long)usage.ru_stime.tv_sec,
+                (long)usage.ru_stime.tv_usec);
 #endif /* !WIN32 */
 
-    vlen = sprintf(val, "%u", stats.curr_conns - 1); /* ignore listening conn */
-    nbytes = add_stats(pos, "curr_connections", strlen("curr_connections"),
-                       val, vlen, (void *)c);
-    pos += nbytes;
-    *buflen += nbytes;
-
-    vlen = sprintf(val, "%u", stats.total_conns);
-    nbytes = add_stats(pos, "total_connections", strlen("total_connections"),
-                       val, vlen, (void *)c);
-    pos += nbytes;
-    *buflen += nbytes;
-
-    vlen = sprintf(val, "%u", stats.conn_structs);
-    nbytes = add_stats(pos, "connection_structures",
-                       strlen("connection_structures"), val, vlen, (void *)c);
-    pos += nbytes;
-    *buflen += nbytes;
-
-    vlen = sprintf(val, "%llu", (unsigned long long)thread_stats.get_cmds);
-    nbytes = add_stats(pos, "cmd_get", strlen("cmd_get"), val, vlen, (void *)c);
-    pos += nbytes;
-    *buflen += nbytes;
-
-    vlen = sprintf(val, "%llu", (unsigned long long)slab_stats.set_cmds);
-    nbytes = add_stats(pos, "cmd_set", strlen("cmd_set"), val, vlen, (void *)c);
-    pos += nbytes;
-    *buflen += nbytes;
-
-    vlen = sprintf(val, "%llu", (unsigned long long)slab_stats.get_hits);
-    nbytes = add_stats(pos, "get_hits", strlen("get_hits"), val, vlen,
-                       (void *)c);
-    pos += nbytes;
-    *buflen += nbytes;
-
-    vlen = sprintf(val, "%llu", (unsigned long long)thread_stats.get_misses);
-    nbytes = add_stats(pos, "get_misses", strlen("get_misses"), val, vlen,
-                       (void *)c);
-    pos += nbytes;
-    *buflen += nbytes;
-
-    vlen = sprintf(val, "%llu", (unsigned long long)thread_stats.delete_misses);
-    nbytes = add_stats(pos, "delete_misses", strlen("delete_misses"), val, vlen,
-                       (void *)c);
-    pos += nbytes;
-    *buflen += nbytes;
-
-    vlen = sprintf(val, "%llu", (unsigned long long)slab_stats.delete_hits);
-    nbytes = add_stats(pos, "delete_hits", strlen("delete_hits"), val, vlen,
-                       (void *)c);
-    pos += nbytes;
-    *buflen += nbytes;
-
-    vlen = sprintf(val, "%llu", (unsigned long long)thread_stats.incr_misses);
-    nbytes = add_stats(pos, "incr_misses", strlen("incr_misses"), val, vlen,
-                       (void *)c);
-    pos += nbytes;
-    *buflen += nbytes;
-
-    vlen = sprintf(val, "%llu", (unsigned long long)slab_stats.incr_hits);
-    nbytes = add_stats(pos, "incr_hits", strlen("incr_hits"), val, vlen,
-                       (void *)c);
-    pos += nbytes;
-    *buflen += nbytes;
-
-    vlen = sprintf(val, "%llu", (unsigned long long)thread_stats.decr_misses);
-    nbytes = add_stats(pos, "decr_misses", strlen("decr_misses"), val, vlen,
-                       (void *)c);
-    pos += nbytes;
-    *buflen += nbytes;
-
-    vlen = sprintf(val, "%llu", (unsigned long long)slab_stats.decr_hits);
-    nbytes = add_stats(pos, "decr_hits", strlen("decr_hits"), val, vlen,
-                       (void *)c);
-    pos += nbytes;
-    *buflen += nbytes;
-
-    vlen = sprintf(val, "%llu", (unsigned long long)thread_stats.cas_misses);
-    nbytes = add_stats(pos, "cas_misses", strlen("cas_misses"), val, vlen,
-                       (void *)c);
-    pos += nbytes;
-    *buflen += nbytes;
-
-    vlen = sprintf(val, "%llu", (unsigned long long)slab_stats.cas_hits);
-    nbytes = add_stats(pos, "cas_hits", strlen("cas_hits"), val, vlen,
-                       (void *)c);
-    pos += nbytes;
-    *buflen += nbytes;
-
-    vlen = sprintf(val, "%llu", (unsigned long long)slab_stats.cas_badval);
-    nbytes = add_stats(pos, "cas_badval", strlen("cas_badval"), val, vlen,
-                       (void *)c);
-    pos += nbytes;
-    *buflen += nbytes;
-
-    vlen = sprintf(val, "%llu", (unsigned long long)thread_stats.bytes_read);
-    nbytes = add_stats(pos, "bytes_read", strlen("bytes_read"), val, vlen,
-                       (void *)c);
-    pos += nbytes;
-    *buflen += nbytes;
-
-    vlen = sprintf(val, "%llu", (unsigned long long)thread_stats.bytes_written);
-    nbytes = add_stats(pos, "bytes_written", strlen("bytes_written"), val,
-                       vlen, (void *)c);
-    pos += nbytes;
-    *buflen += nbytes;
-
-    vlen = sprintf(val, "%llu", (unsigned long long)settings.maxbytes);
-    nbytes = add_stats(pos, "limit_maxbytes", strlen("limit_maxbytes"), val,
-                       vlen, (void *)c);
-    pos += nbytes;
-    *buflen += nbytes;
-
-    vlen = sprintf(val, "%u", settings.num_threads);
-    nbytes = add_stats(pos, "threads", strlen("threads"), val, vlen, (void *)c);
-    pos += nbytes;
-    *buflen += nbytes;
-
-    assert(*buflen < sizeof(temp));
-
-    if(*buflen > 0 && (buf = malloc(*buflen)) == NULL) {
-        STATS_UNLOCK();
-        return NULL;
-    }
-
-    memcpy(buf, temp, *buflen);
+    APPEND_STAT("curr_connections", "%u", stats.curr_conns - 1);
+    APPEND_STAT("total_connections", "%u", stats.total_conns);
+    APPEND_STAT("connection_structures", "%u", stats.conn_structs);
+    APPEND_STAT("cmd_get", "%llu", (unsigned long long)thread_stats.get_cmds);
+    APPEND_STAT("cmd_set", "%llu", (unsigned long long)slab_stats.set_cmds);
+    APPEND_STAT("cmd_flush", "%llu", (unsigned long long)thread_stats.flush_cmds);
+    APPEND_STAT("get_hits", "%llu", (unsigned long long)slab_stats.get_hits);
+    APPEND_STAT("get_misses", "%llu", (unsigned long long)thread_stats.get_misses);
+    APPEND_STAT("delete_misses", "%llu", (unsigned long long)thread_stats.delete_misses);
+    APPEND_STAT("delete_hits", "%llu", (unsigned long long)slab_stats.delete_hits);
+    APPEND_STAT("incr_misses", "%llu", (unsigned long long)thread_stats.incr_misses);
+    APPEND_STAT("incr_hits", "%llu", (unsigned long long)slab_stats.incr_hits);
+    APPEND_STAT("decr_misses", "%llu", (unsigned long long)thread_stats.decr_misses);
+    APPEND_STAT("decr_hits", "%llu", (unsigned long long)slab_stats.decr_hits);
+    APPEND_STAT("cas_misses", "%llu", (unsigned long long)thread_stats.cas_misses);
+    APPEND_STAT("cas_hits", "%llu", (unsigned long long)slab_stats.cas_hits);
+    APPEND_STAT("cas_badval", "%llu", (unsigned long long)slab_stats.cas_badval);
+    APPEND_STAT("bytes_read", "%llu", (unsigned long long)thread_stats.bytes_read);
+    APPEND_STAT("bytes_written", "%llu", (unsigned long long)thread_stats.bytes_written);
+    APPEND_STAT("limit_maxbytes", "%llu", (unsigned long long)settings.maxbytes);
+    APPEND_STAT("accepting_conns", "%u", stats.accepting_conns);
+    APPEND_STAT("listen_disabled_num", "%llu", (unsigned long long)stats.listen_disabled_num);
+    APPEND_STAT("threads", "%d", settings.num_threads);
     STATS_UNLOCK();
-
-    return buf;
 }
 
-uint32_t append_ascii_stats(char *buf, const char *key, const uint16_t klen,
-                            const char *val, const uint32_t vlen, void *cookie) {
-    char *pos = buf;
-    uint32_t nbytes = 0;
-
-    /* value without a key is invalid */
-    if (buf == NULL || (klen == 0 && vlen > 0)) return 0;
-
-    if (klen == 0 && vlen == 0)
-        nbytes = sprintf(pos, "END\r\n");
-    else if (vlen == 0)
-        nbytes = sprintf(pos, "STAT %s\r\n", key);
-    else
-        nbytes = sprintf(pos, "STAT %s %s\r\n", key, val);
-
-    return nbytes;
+static void process_stat_settings(ADD_STAT add_stats, void *c) {
+    assert(add_stats);
+    APPEND_STAT("maxbytes", "%u", (unsigned int)settings.maxbytes);
+    APPEND_STAT("maxconns", "%d", settings.maxconns);
+    APPEND_STAT("tcpport", "%d", settings.port);
+    APPEND_STAT("udpport", "%d", settings.udpport);
+    APPEND_STAT("inter", "%s", settings.inter ? settings.inter : "NULL");
+    APPEND_STAT("verbosity", "%d", settings.verbose);
+    APPEND_STAT("oldest", "%lu", (unsigned long)settings.oldest_live);
+    APPEND_STAT("evictions", "%s", settings.evict_to_free ? "on" : "off");
+    APPEND_STAT("domain_socket", "%s",
+                settings.socketpath ? settings.socketpath : "NULL");
+    APPEND_STAT("umask", "%o", settings.access);
+    APPEND_STAT("growth_factor", "%.2f", settings.factor);
+    APPEND_STAT("chunk_size", "%d", settings.chunk_size);
+    APPEND_STAT("num_threads", "%d", settings.num_threads);
+    APPEND_STAT("stat_key_prefix", "%c", settings.prefix_delimiter);
+    APPEND_STAT("detail_enabled", "%s",
+                settings.detail_enabled ? "yes" : "no");
+    APPEND_STAT("reqs_per_event", "%d", settings.reqs_per_event);
+    APPEND_STAT("cas_enabled", "%s", settings.use_cas ? "yes" : "no");
+    APPEND_STAT("tcp_backlog", "%d", settings.backlog);
 }
 
 static void process_stat(conn *c, token_t *tokens, const size_t ntokens) {
-    char *command;
-    char *subcommand;
-
+    const char *subcommand = tokens[SUBCOMMAND_TOKEN].value;
     assert(c != NULL);
 
-    if(ntokens < 2) {
+    if (ntokens < 2) {
         out_string(c, "CLIENT_ERROR bad command line");
         return;
     }
 
-    command = tokens[COMMAND_TOKEN].value;
-
-    if (ntokens == 2 && strcmp(command, "stats") == 0) {
-        int server_len, engine_len;
-        char *buf, *ptr, *server_statbuf, *engine_statbuf;
-
-        if ((server_statbuf = server_stats(&append_ascii_stats, c,
-                                           &server_len)) == NULL) {
-            out_string(c, "SERVER_ERROR out of memory writing stats");
-            return;
-        }
-
-        if ((engine_statbuf = get_stats(NULL, 0, &append_ascii_stats, (void *)c,
-                                        &engine_len)) == NULL) {
-            free(server_statbuf);
-            out_string(c, "SERVER_ERROR out of memory writing stats");
-            return;
-        }
-
-        /* 6 is: strlen("END\r\n") + sizeof("\0") */
-        buf = calloc(1, server_len + engine_len + 6);
-
-        if (buf == NULL) {
-            free(server_statbuf);
-            free(engine_statbuf);
-            out_string(c, "SERVER_ERROR out of memory writing stats");
-            return;
-        }
-
-        ptr = buf;
-
-        memcpy(ptr, server_statbuf, server_len);
-        ptr += server_len;
-        memcpy(ptr, engine_statbuf, engine_len);
-        ptr += engine_len;
-
-        /* append terminator */
-        engine_len += append_ascii_stats(ptr, NULL, 0, NULL, 0, (void *)c);
-
-        free(server_statbuf);
-        free(engine_statbuf);
-
-        write_and_free(c, buf, server_len + engine_len);
-        return;
-    }
-
-    subcommand = tokens[SUBCOMMAND_TOKEN].value;
-
-    if (strcmp(subcommand, "reset") == 0) {
+    if (ntokens == 2) {
+        server_stats(&append_stats, c);
+        (void)get_stats(NULL, 0, &append_stats, c);
+    } else if (strcmp(subcommand, "reset") == 0) {
         stats_reset();
         out_string(c, "RESET");
-        return;
-    }
-
-    /* NOTE: how to tackle detail with binary? */
-    if (strcmp(subcommand, "detail") == 0) {
+        return ;
+    } else if (strcmp(subcommand, "detail") == 0) {
+        /* NOTE: how to tackle detail with binary? */
         if (ntokens < 4)
             process_stats_detail(c, "");  /* outputs the error message */
         else
             process_stats_detail(c, tokens[2].value);
-        return;
-    }
-
-
-    if (strcmp(subcommand, "cachedump") == 0) {
-
+        /* Output already generated */
+        return ;
+    } else if (strcmp(subcommand, "settings") == 0) {
+        process_stat_settings(&append_stats, c);
+    } else if (strcmp(subcommand, "cachedump") == 0) {
         char *buf;
         unsigned int bytes, id, limit = 0;
 
@@ -2398,32 +2247,40 @@ static void process_stat(conn *c, token_t *tokens, const size_t ntokens) {
             return;
         }
 
-        id = strtoul(tokens[2].value, NULL, 10);
-        limit = strtoul(tokens[3].value, NULL, 10);
-
-        if(errno == ERANGE) {
+        if (!safe_strtoul(tokens[2].value, &id) ||
+            !safe_strtoul(tokens[3].value, &limit)) {
             out_string(c, "CLIENT_ERROR bad command line format");
             return;
         }
 
         buf = item_cachedump(id, limit, &bytes);
         write_and_free(c, buf, bytes);
-        return;
+        return ;
+    } else {
+        /* getting here means that the subcommand is either engine specific or
+           is invalid. query the engine and see. */
+        if (get_stats(subcommand, strlen(subcommand), &append_stats, c)) {
+            if (c->stats.buffer == NULL) {
+                out_string(c, "SERVER_ERROR out of memory writing stats");
+            } else {
+                write_and_free(c, c->stats.buffer, c->stats.offset);
+                c->stats.buffer = NULL;
+            }
+        } else {
+            out_string(c, "ERROR");
+        }
+        return ;
     }
 
+    /* append terminator and start the transfer */
+    append_stats(NULL, 0, NULL, 0, c);
 
-    /* getting here means that the subcommand is either engine specific or
-       is invalid. query the engine and see. */
-    int bytes = 0;
-    char *buf = get_stats(subcommand, strlen(subcommand),
-        &append_ascii_stats, (void *)c, &bytes);
-
-    if (buf && bytes > 0) {
-        write_and_free(c, buf, bytes);
-        return;
+    if (c->stats.buffer == NULL) {
+        out_string(c, "SERVER_ERROR out of memory writing stats");
+    } else {
+        write_and_free(c, c->stats.buffer, c->stats.offset);
+        c->stats.buffer = NULL;
     }
-
-    out_string(c, "ERROR");
 }
 
 static inline bool process_get_item (conn *c, item *it, int *stats_get_hits, const int stats_get_cmds, const int stats_get_misses, bool return_cas) {
@@ -2758,7 +2615,8 @@ static inline void process_pget_command(conn *c, token_t *tokens, size_t ntokens
 static void process_update_command(conn *c, token_t *tokens, const size_t ntokens, int comm, bool handle_cas) {
     char *key;
     size_t nkey;
-    int flags;
+    unsigned int flags;
+    int32_t exptime_int = 0;
     time_t exptime;
     int vlen;
     uint64_t req_cas_id=0;
@@ -2776,19 +2634,23 @@ static void process_update_command(conn *c, token_t *tokens, const size_t ntoken
     key = tokens[KEY_TOKEN].value;
     nkey = tokens[KEY_TOKEN].length;
 
-    flags = strtoul(tokens[2].value, NULL, 10);
-    exptime = strtol(tokens[3].value, NULL, 10);
-    vlen = strtol(tokens[4].value, NULL, 10);
-
-    // does cas value exist?
-    if(handle_cas) {
-      req_cas_id = strtoull(tokens[5].value, NULL, 10);
-    }
-
-    if(errno == ERANGE || ((flags == 0 || exptime == 0) && errno == EINVAL)
-       || vlen < 0) {
+    if (! (safe_strtoul(tokens[2].value, (uint32_t *)&flags)
+           && safe_strtol(tokens[3].value, &exptime_int)
+           && safe_strtol(tokens[4].value, (int32_t *)&vlen))) {
         out_string(c, "CLIENT_ERROR bad command line format");
         return;
+    }
+
+    /* Ubuntu 8.04 breaks when I pass exptime to safe_strtol */
+    exptime = exptime_int;
+
+    // does cas value exist?
+    if (handle_cas) {
+        if (!safe_strtoull(tokens[5].value, &req_cas_id)
+            || vlen < 0 ) {
+            out_string(c, "CLIENT_ERROR bad command line format");
+            return;
+        }
     }
 
     if (settings.detail_enabled) {
@@ -2830,7 +2692,7 @@ static void process_update_command(conn *c, token_t *tokens, const size_t ntoken
 static void process_arithmetic_command(conn *c, token_t *tokens, const size_t ntokens, const bool incr) {
     char temp[sizeof("18446744073709551615")];
     item *it;
-    int64_t delta;
+    uint64_t delta;
     char *key;
     size_t nkey;
 
@@ -2838,7 +2700,7 @@ static void process_arithmetic_command(conn *c, token_t *tokens, const size_t nt
 
     set_noreply_maybe(c, tokens, ntokens);
 
-    if(tokens[KEY_TOKEN].length > KEY_MAX_LENGTH) {
+    if (tokens[KEY_TOKEN].length > KEY_MAX_LENGTH) {
         out_string(c, "CLIENT_ERROR bad command line format");
         return;
     }
@@ -2846,10 +2708,8 @@ static void process_arithmetic_command(conn *c, token_t *tokens, const size_t nt
     key = tokens[KEY_TOKEN].value;
     nkey = tokens[KEY_TOKEN].length;
 
-    delta = strtoll(tokens[2].value, NULL, 10);
-
-    if(errno == ERANGE) {
-        out_string(c, "CLIENT_ERROR bad command line format");
+    if (!safe_strtoull(tokens[2].value, &delta)) {
+        out_string(c, "CLIENT_ERROR invalid numeric delta argument");
         return;
     }
 
@@ -2888,11 +2748,8 @@ char *do_add_delta(conn *c, item *it, const bool incr, const int64_t delta, char
     int res;
 
     ptr = ITEM_data(it);
-    while ((*ptr != '\0') && (*ptr < '0' && *ptr > '9')) ptr++;    // BUG: can't be true
 
-    value = strtoull(ptr, NULL, 10);
-
-    if(errno == ERANGE) {
+    if (!safe_strtoull(ptr, &value)) {
         return "CLIENT_ERROR cannot increment or decrement non-numeric value";
     }
 
@@ -3131,6 +2988,10 @@ static void process_command(conn *c, char *command) {
 
         set_noreply_maybe(c, tokens, ntokens);
 
+        STATS_LOCK();
+        c->thread->stats.flush_cmds++;
+        STATS_UNLOCK();
+
         if(ntokens == (c->noreply ? 3 : 2)) {
             settings.oldest_live = current_time - 1;
             item_flush_expired();
@@ -3319,9 +3180,8 @@ static int try_read_command(conn *c) {
 
 /*
  * read a UDP request.
- * return 0 if there's nothing to read.
  */
-static int try_read_udp(conn *c) {
+static enum try_read_result try_read_udp(conn *c) {
     int res;
 
     assert(c != NULL);
@@ -3341,7 +3201,7 @@ static int try_read_udp(conn *c) {
         /* If this is a multi-packet request, drop it. */
         if (buf[4] != 0 || buf[5] != 1) {
             out_string(c, "SERVER_ERROR multi-packet request not supported");
-            return 0;
+            return READ_NO_DATA_RECEIVED;
         }
 
         /* Don't care about any of the rest of the header. */
@@ -3350,9 +3210,9 @@ static int try_read_udp(conn *c) {
 
         c->rbytes += res;
         c->rcurr = c->rbuf;
-        return 1;
+        return READ_DATA_RECEIVED;
     }
-    return 0;
+    return READ_NO_DATA_RECEIVED;
 }
 
 /*
@@ -3360,13 +3220,10 @@ static int try_read_udp(conn *c) {
  * close.
  * before reading, move the remaining incomplete fragment of a command
  * (if any) to the beginning of the buffer.
- * @return 1 data received
- *         0 no data received
- *        -1 an error occured (on the socket) (or client closed connection)
- *        -2 memory error (failed to allocate more memory)
+ * @return enum try_read_result
  */
-static int try_read_network(conn *c) {
-    int gotdata = 0;
+static enum try_read_result try_read_network(conn *c) {
+    enum try_read_result gotdata = READ_NO_DATA_RECEIVED;
     int res;
 
     assert(c != NULL);
@@ -3386,7 +3243,7 @@ static int try_read_network(conn *c) {
                 c->rbytes = 0; /* ignore what we read */
                 out_string(c, "SERVER_ERROR out of memory reading request");
                 c->write_and_go = conn_closing;
-                return -2;
+                return READ_MEMORY_ERROR;
             }
             c->rcurr = c->rbuf = new_rbuf;
             c->rsize *= 2;
@@ -3398,7 +3255,7 @@ static int try_read_network(conn *c) {
             pthread_mutex_lock(&c->thread->stats.mutex);
             c->thread->stats.bytes_read += res;
             pthread_mutex_unlock(&c->thread->stats.mutex);
-            gotdata = 1;
+            gotdata = READ_DATA_RECEIVED;
             c->rbytes += res;
             if (res == avail) {
                 continue;
@@ -3407,13 +3264,13 @@ static int try_read_network(conn *c) {
             }
         }
         if (res == 0) {
-            return -1;
+            return READ_ERROR;
         }
         if (res == -1) {
             if (errno == EAGAIN || errno == EWOULDBLOCK) {
                 break;
             }
-            return -1;
+            return READ_ERROR;
         }
     }
     return gotdata;
@@ -3445,7 +3302,7 @@ void accept_new_conns(const bool do_accept) {
     for (next = listen_conn; next; next = next->next) {
         if (do_accept) {
             update_event(next, EV_READ | EV_PERSIST);
-            if (listen(next->sfd, 1024) != 0) {
+            if (listen(next->sfd, settings.backlog) != 0) {
                 perror("listen");
             }
         }
@@ -3455,7 +3312,18 @@ void accept_new_conns(const bool do_accept) {
                 perror("listen");
             }
         }
-  }
+    }
+
+    if (do_accept) {
+        STATS_LOCK();
+        stats.accepting_conns = true;
+        STATS_UNLOCK();
+    } else {
+        STATS_LOCK();
+        stats.accepting_conns = false;
+        stats.listen_disabled_num++;
+        STATS_UNLOCK();
+    }
 }
 
 /*
@@ -3467,7 +3335,7 @@ void accept_new_conns(const bool do_accept) {
  *   TRANSMIT_SOFT_ERROR Can't write any more right now.
  *   TRANSMIT_HARD_ERROR Can't write (c->state is set to conn_closing)
  */
-static int transmit(conn *c) {
+static enum transmit_result transmit(conn *c) {
     assert(c != NULL);
 
     if (c->msgcurr < c->msgused &&
@@ -3583,19 +3451,19 @@ static void drive_machine(conn *c) {
             res = IS_UDP(c->protocol) ? try_read_udp(c) : try_read_network(c);
 
             switch (res) {
-            case 0 :
+            case READ_NO_DATA_RECEIVED:
                 conn_set_state(c, conn_waiting);
                 break;
-            case 1:
+            case READ_DATA_RECEIVED:
              /* Only process nreqs at a time to avoid starving other
                 connections */
                 if (--nreqs)
                     conn_set_state(c, conn_parse_cmd);
                 break;
-            case -1:
+            case READ_ERROR:
                 conn_set_state(c, conn_closing);
                 break;
-            case -2: /* Failed to allocate more memory */
+            case READ_MEMORY_ERROR: /* Failed to allocate more memory */
                 /* State already set by try_read_network */
                 break;
             }
@@ -3822,7 +3690,6 @@ static int new_socket(struct addrinfo *ai) {
     int flags;
 
     if ((sfd = socket(ai->ai_family, ai->ai_socktype, ai->ai_protocol)) == -1) {
-        perror("socket()");
         return -1;
     }
 
@@ -3888,12 +3755,6 @@ static int server_socket(const int port, enum protocol prot) {
      */
     memset(&hints, 0, sizeof (hints));
     hints.ai_flags = AI_PASSIVE;
-
-    /* Only use AI_ADDRCONFIG if a hostname is specified, otherwise we might
-     * not get results for INADDR_ANY. */
-    if (settings.inter)
-        hints.ai_flags |= AI_ADDRCONFIG;
-
     hints.ai_family = AF_UNSPEC;
     hints.ai_socktype = IS_UDP(prot) ? SOCK_DGRAM : SOCK_STREAM;
 
@@ -3911,8 +3772,10 @@ static int server_socket(const int port, enum protocol prot) {
     for (next= ai; next; next= next->ai_next) {
         conn *listen_conn_add;
         if ((sfd = new_socket(next)) == -1) {
-            freeaddrinfo(ai);
-            return 1;
+            /* getaddrinfo can return "junk" addresses,
+             * we make sure at least one works before erroring.
+             */
+            continue;
         }
 
 #ifdef IPV6_V6ONLY
@@ -3954,7 +3817,7 @@ static int server_socket(const int port, enum protocol prot) {
             continue;
         } else {
             success++;
-            if (!IS_UDP(prot) && listen(sfd, 1024) == -1) {
+            if (!IS_UDP(prot) && listen(sfd, settings.backlog) == -1) {
                 perror("listen()");
                 close(sfd);
                 freeaddrinfo(ai);
@@ -4050,7 +3913,7 @@ static int server_socket_unix(const char *path, int access_mask) {
         return 1;
     }
     umask(old_umask);
-    if (listen(sfd, 1024) == -1) {
+    if (listen(sfd, settings.backlog) == -1) {
         perror("listen()");
         close(sfd);
         return 1;
@@ -4139,11 +4002,17 @@ static void usage(void) {
 #endif
            );
 
+    printf("-D <char>     Use <char> as the delimiter between key prefixes and IDs.\n"
+           "              This is used for per-prefix stats reporting. The default is\n"
+           "              \":\" (colon). If this option is specified, stats collection\n"
+           "              is turned on automatically; if not, then it may be turned on\n"
+           "              by sending the \"stats detail on\" command to the server.\n");
     printf("-t <num>      number of threads to use, default 4\n");
     printf("-R            Maximum number of requests per event\n"
            "              limits the number of requests process for a given con nection\n"
            "              to prevent starvation.  default 20\n");
     printf("-C            Disable use of CAS\n");
+    printf("-b            Set the backlog queue limit (default 1024)\n");
     return;
 }
 
@@ -4318,7 +4187,32 @@ int main (int argc, char **argv) {
     setbuf(stderr, NULL);
 
     /* process arguments */
-    while ((c = getopt(argc, argv, "a:p:s:U:m:Mc:khirvdl:u:P:f:s:n:t:D:LR:C")) != -1) {
+    while (-1 != (c = getopt(argc, argv,
+          "a:"  /* access mask for unix socket */
+          "p:"  /* TCP port number to listen on */
+          "s:"  /* unix socket path to listen on */
+          "U:"  /* UDP port number to listen on */
+          "m:"  /* max memory to use for items in megabytes */
+          "M"   /* return error on memory exhausted */
+          "c:"  /* max simultaneous connections */
+          "k"   /* lock down all paged memory */
+          "hi"  /* help, licence info */
+          "r"   /* maximize core file limit */
+          "v"   /* verbose */
+          "d"   /* daemon mode */
+          "l:"  /* interface to listen on */
+          "u:"  /* user identity to run as */
+          "P:"  /* save PID in file */
+          "f:"  /* factor? */
+          "s:"  /* unix socket */
+          "n:"  /* minimum space allocated for key+value+flags */
+          "t:"  /* threads */
+          "D:"  /* prefix delimiter? */
+          "L"   /* Large memory pages */
+          "R:"  /* max requests per event */
+          "C"  /* Disable use of CAS */
+          "b:"   /* backlog queue limit */
+        ))) {
         switch (c) {
         case 'a':
             /* access for unix domain socket, as octal mask (like chmod)*/
@@ -4415,6 +4309,9 @@ int main (int argc, char **argv) {
             break;
         case 'C' :
             settings.use_cas = false;
+            break;
+        case 'b' :
+            settings.backlog = atoi(optarg);
             break;
         default:
             fprintf(stderr, "Illegal argument \"%c\"\n", c);

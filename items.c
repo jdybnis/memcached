@@ -29,6 +29,7 @@ typedef struct {
     unsigned int evicted;
     rel_time_t evicted_time;
     unsigned int outofmemory;
+    unsigned int tailrepairs;
 } itemstats_t;
 
 static item *heads[LARGEST_ID];
@@ -50,6 +51,13 @@ void item_init(void) {
         sizes[i] = 0;
     }
 }
+
+void item_stats_reset(void) {
+    pthread_mutex_lock(&cache_lock);
+    memset(itemstats, 0, sizeof(itemstats_t) * LARGEST_ID);
+    pthread_mutex_unlock(&cache_lock);
+}
+
 
 /* Get the next CAS id for a new item. */
 uint64_t get_cas_id(void) {
@@ -94,7 +102,7 @@ static size_t item_make_header(const uint8_t nkey, const int flags, const int nb
 /*@null@*/
 item *do_item_alloc(char *key, const size_t nkey, const int flags, const rel_time_t exptime, const int nbytes) {
     uint8_t nsuffix;
-    item *it;
+    item *it = NULL;
     char suffix[40];
     int levels = 0;
 #ifdef SKIPLIST
@@ -113,10 +121,34 @@ item *do_item_alloc(char *key, const size_t nkey, const int flags, const rel_tim
     if (id == 0)
         return 0;
 
-    it = slabs_alloc(ntotal, id);
-    if (it == 0) {
-        int tries = 50;
-        item *search;
+    /* do a quick check if we have any expired items in the tail.. */
+    int tries = 50;
+    item *search;
+
+    for (search = tails[id];
+         tries > 0 && search != NULL;
+         tries--, search=search->prev) {
+        if (search->refcount == 0 &&
+            (search->exptime != 0 && search->exptime < current_time)) {
+            it = search;
+            /* I don't want to actually free the object, just steal
+             * the item to avoid to grab the slab mutex twice ;-)
+             */
+            it->refcount = 1;
+            do_item_unlink(it);
+            /* Initialize the item block: */
+            it->slabs_clsid = 0;
+            it->refcount = 0;
+            break;
+        }
+    }
+
+    if (it == NULL && (it = slabs_alloc(ntotal, id)) == NULL) {
+        /*
+        ** Could not find an expired item at the tail, and memory allocation
+        ** failed. Try to evict some items!
+        */
+        tries = 50;
 
         /* If requested to not push old items out of cache when memory runs out,
          * we're out of luck at this point...
@@ -155,7 +187,26 @@ item *do_item_alloc(char *key, const size_t nkey, const int flags, const rel_tim
         it = slabs_alloc(ntotal, id);
         if (it == 0) {
             itemstats[id].outofmemory++;
-            return NULL;
+            /* Last ditch effort. There is a very rare bug which causes
+             * refcount leaks. We've fixed most of them, but it still happens,
+             * and it may happen in the future.
+             * We can reasonably assume no item can stay locked for more than
+             * three hours, so if we find one in the tail which is that old,
+             * free it anyway.
+             */
+            tries = 50;
+            for (search = tails[id]; tries > 0 && search != NULL; tries--, search=search->prev) {
+                if (search->refcount != 0 && search->time + TAIL_REPAIR_TIME < current_time) {
+                    itemstats[id].tailrepairs++;
+                    search->refcount = 0;
+                    do_item_unlink(search);
+                    break;
+                }
+            }
+            it = slabs_alloc(ntotal, id);
+            if (it == 0) {
+                return NULL;
+            }
         }
     }
 
@@ -369,148 +420,113 @@ char *do_item_cachedump(const unsigned int slabs_clsid, const unsigned int limit
     return buffer;
 }
 
-char *do_item_stats(uint32_t (*add_stats)(char *buf,
-                    const char *key, const uint16_t klen, const char *val,
-                    const uint32_t vlen, void *cookie), void *c, int *bytes) {
-
-    size_t bufleft = (size_t) LARGEST_ID * 240;
-    char *buffer = malloc(bufleft);
-    char *bufcurr = buffer;
-    rel_time_t now = current_time;
-    protocol_binary_response_header *header;
-    int hdrsiz = sizeof(header->response);
-    int i, linelen = 0;
-
-    if (buffer == NULL) {
-        *bytes = -1;
-        return NULL;
-    }
-
+void do_item_stats(ADD_STAT add_stats, void *c) {
+    int i;
     for (i = 0; i < LARGEST_ID; i++) {
         if (tails[i] != NULL) {
-            char key[128];
-            char val[256];
-            uint32_t nbytes = 0;
+            const char *fmt = "items:%d:%s";
+            char key_str[128];
+            char val_str[256];
+            int klen = 0, vlen = 0;
 
-            sprintf(key, "items:%d:number", i);
-            sprintf(val, "%u", sizes[i]);
-            nbytes = add_stats(bufcurr, key, strlen(key), val, strlen(val), c);
-            linelen += nbytes;
-            bufcurr += nbytes;
-
-            sprintf(key, "items:%d:age", i);
-            sprintf(val, "%u", now - tails[i]->time);
-            nbytes = add_stats(bufcurr, key, strlen(key), val, strlen(val), c);
-            linelen += nbytes;
-            bufcurr += nbytes;
-
-            sprintf(key, "items:%d:evicted", i);
-            sprintf(val, "%u", itemstats[i].evicted);
-            nbytes = add_stats(bufcurr, key, strlen(key), val, strlen(val), c);
-            linelen += nbytes;
-            bufcurr += nbytes;
-
-            sprintf(key, "items:%d:evicted_time", i);
-            sprintf(val, "%u", itemstats[i].evicted_time);
-            nbytes = add_stats(bufcurr, key, strlen(key), val, strlen(val), c);
-            linelen += nbytes;
-            bufcurr += nbytes;
-
-            sprintf(key, "items:%d:outofmemory", i);
-            sprintf(val, "%u", itemstats[i].outofmemory);
-            nbytes = add_stats(bufcurr, key, strlen(key), val, strlen(val), c);
-            linelen += nbytes;
-            bufcurr += nbytes;
-
-            /* check whether binary protocol terminator will fit */
-            if (linelen + hdrsiz < bufleft) {
-                bufleft -= linelen;
-            } else {
-                free(buffer);
-                return NULL;
-            }
+            APPEND_NUM_FMT_STAT(fmt, i, "number", "%u", sizes[i]);
+            APPEND_NUM_FMT_STAT(fmt, i, "age", "%u", tails[i]->time);
+            APPEND_NUM_FMT_STAT(fmt, i, "evicted",
+                                "%u", itemstats[i].evicted);
+            APPEND_NUM_FMT_STAT(fmt, i, "evicted_time",
+                                "%u", itemstats[i].evicted_time);
+            APPEND_NUM_FMT_STAT(fmt, i, "outofmemory",
+                                "%u", itemstats[i].outofmemory);
+            APPEND_NUM_FMT_STAT(fmt, i, "tailrepairs",
+                                "%u", itemstats[i].tailrepairs);;
         }
     }
 
     /* getting here means both ascii and binary terminators fit */
-    linelen += add_stats(bufcurr, NULL, 0, NULL, 0, c);
-    *bytes = linelen;
-
-    return buffer;
+    add_stats(NULL, 0, NULL, 0, c);
 }
 
 /** dumps out a list of objects of each size, with granularity of 32 bytes */
 /*@null@*/
-char *do_item_stats_sizes(uint32_t (*add_stats)(char *buf,
-                          const char *key, const uint16_t klen, const char *val,
-                          const uint32_t vlen, void *cookie), void *c, int *bytes) {
+void do_item_stats_sizes(ADD_STAT add_stats, void *c) {
 
-    const int num_buckets = 32768;   /* max 1MB object, divided into 32 bytes size buckets */
-    unsigned int *histogram = (unsigned int *)malloc((size_t)num_buckets * sizeof(int));
-    char *buf = (char *)malloc(2 * 1024 * 1024); /* 2MB max response size */
-    char *ptr = buf;
-    uint32_t nbytes, linelen = 0;
-    int i;
+    /* max 1MB object, divided into 32 bytes size buckets */
+    const int num_buckets = 32768;
+    unsigned int *histogram = calloc(num_buckets, sizeof(int));
 
-    if (histogram == 0 || buf == 0) {
-        if (histogram) free(histogram);
-        if (buf) free(buf);
-        *bytes = -1;
-        return NULL;
-    }
+    if (histogram != NULL) {
+        int i;
 
-    /* build the histogram */
-    memset(histogram, 0, (size_t)num_buckets * sizeof(int));
-    for (i = 0; i < LARGEST_ID; i++) {
-        item *iter = heads[i];
-        while (iter) {
-            int ntotal = ITEM_ntotal(iter);
-            int bucket = ntotal / 32;
-            if ((ntotal % 32) != 0) bucket++;
-            if (bucket < num_buckets) histogram[bucket]++;
-            iter = iter->next;
+        /* build the histogram */
+        for (i = 0; i < LARGEST_ID; i++) {
+            item *iter = heads[i];
+            while (iter) {
+                int ntotal = ITEM_ntotal(iter);
+                int bucket = ntotal / 32;
+                if ((ntotal % 32) != 0) bucket++;
+                if (bucket < num_buckets) histogram[bucket]++;
+                iter = iter->next;
+            }
         }
-    }
 
-    /* write the buffer */
-    *bytes = 0;
-    char key[128];
-    char val[128];
-
-    for (i = 0; i < num_buckets; i++) {
-        if (histogram[i] != 0) {
-            sprintf(key, "%d", i * 32);
-            sprintf(val, "%u", histogram[i]);
-            nbytes = add_stats(ptr, key, strlen(key), val, strlen(val), c);
-            linelen += nbytes;
-            ptr += nbytes;
+        /* write the buffer */
+        for (i = 0; i < num_buckets; i++) {
+            if (histogram[i] != 0) {
+                char key[8];
+                int klen = 0;
+                klen = sprintf(key, "%d", i * 32);
+                assert(klen < sizeof(key));
+                APPEND_STAT(key, "%u", histogram[i]);
+            }
         }
+        free(histogram);
     }
-
-    nbytes = add_stats(ptr, NULL, 0, NULL, 0, c);
-    *bytes = linelen + nbytes;
-
-    free(histogram);
-    return buf;
+    add_stats(NULL, 0, NULL, 0, c);
 }
 
 /** wrapper around assoc_find which does the lazy expiration logic */
 item *do_item_get(const char *key, const size_t nkey) {
     item *it = assoc_find(key, nkey);
+    int was_found = 0;
+
+    if (settings.verbose > 2) {
+        if (it == NULL) {
+            fprintf(stderr, "> NOT FOUND %s", key);
+        } else {
+            fprintf(stderr, "> FOUND KEY %s", ITEM_key(it));
+            was_found++;
+        }
+    }
+
     if (it != NULL && settings.oldest_live != 0 && settings.oldest_live <= current_time &&
         it->time <= settings.oldest_live) {
         do_item_unlink(it);           /* MTSAFE - cache_lock held */
         it = NULL;
     }
+
+    if (it == NULL && was_found) {
+        fprintf(stderr, " -nuked by flush");
+        was_found--;
+    }
+
     if (it != NULL && it->exptime != 0 && it->exptime <= current_time) {
         do_item_unlink(it);           /* MTSAFE - cache_lock held */
         it = NULL;
+    }
+
+    if (it == NULL && was_found) {
+        fprintf(stderr, " -nuked by expire");
+        was_found--;
     }
 
     if (it != NULL) {
         it->refcount++;
         DEBUG_REFCNT(it, '+');
     }
+
+    if (settings.verbose > 2)
+        fprintf(stderr, "\n");
+
     return it;
 }
 

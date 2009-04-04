@@ -27,7 +27,7 @@
 #define UDP_MAX_PAYLOAD_SIZE 1400
 #define UDP_HEADER_SIZE 8
 #define MAX_SENDBUF_SIZE (256 * 1024 * 1024)
-/* I'm told the max legnth of a 64-bit num converted to string is 20 bytes.
+/* I'm told the max length of a 64-bit num converted to string is 20 bytes.
  * Plus a few for spaces, \r\n, \0 */
 #define SUFFIX_SIZE 24
 
@@ -72,6 +72,10 @@
 #define RGET_MAX_ITEMS 100
 #endif
 
+/* How long an object can reasonably be assumed to be locked before
+   harvesting it on a low memory condition. */
+#define TAIL_REPAIR_TIME (3 * 3600)
+
 /** Time relative to server start. Smaller than time_t on 64-bit systems. */
 typedef unsigned int rel_time_t;
 
@@ -96,6 +100,7 @@ struct thread_stats {
     uint64_t          cas_misses;
     uint64_t          bytes_read;
     uint64_t          bytes_written;
+    uint64_t          flush_cmds;
     struct slab_stats slab_stats[MAX_NUMBER_OF_SLAB_CLASSES];
 };
 
@@ -107,11 +112,19 @@ struct stats {
     unsigned int  curr_conns;
     unsigned int  total_conns;
     unsigned int  conn_structs;
+    uint64_t      get_cmds;
+    uint64_t      set_cmds;
+    uint64_t      get_hits;
+    uint64_t      get_misses;
     uint64_t      evictions;
+    time_t        started;          /* when the process was started */
+    bool          accepting_conns;  /* whether we are currently accepting */
+    uint64_t      listen_disabled_num;
 };
 
 #define MAX_VERBOSITY_LEVEL 2
 
+/* When adding a setting, be sure to update process_stat_settings */
 struct settings {
     size_t maxbytes;
     int maxconns;
@@ -131,6 +144,7 @@ struct settings {
     int reqs_per_event;     /* Maximum number of io to process on each
                                io-event. */
     bool use_cas;
+    int backlog;
 };
 
 extern struct stats stats;
@@ -192,6 +206,25 @@ typedef struct _stritem {
 #define ITEM_ntotal(item) (sizeof(struct _stritem) + (item)->nkey + 1 \
          + (item)->nsuffix + (item)->nbytes \
          + (((item)->it_flags & ITEM_CAS) ? sizeof(uint64_t) : 0))
+
+/* Append a simple stat with a stat name, value format and value */
+#define APPEND_STAT(name, fmt, val) \
+    append_stat(name, add_stats, c, fmt, val);
+
+/* Append an indexed stat with a stat name (with format), value format
+   and value */
+#define APPEND_NUM_FMT_STAT(name_fmt, num, name, fmt, val)   \
+    klen = sprintf(key_str, name_fmt, num, name);            \
+    vlen = sprintf(val_str, fmt, val);                       \
+    add_stats(key_str, klen, val_str, vlen, c);
+
+/* Common APPEND_NUM_FMT_STAT format. */
+#define APPEND_NUM_STAT(num, name, fmt, val) \
+    APPEND_NUM_FMT_STAT("%d:%s", num, name, fmt, val)
+
+typedef void (*ADD_STAT)(const char *key, const uint16_t klen,
+                         const char *val, const uint32_t vlen,
+                         const void *cookie);
 
 /**
  * NOTE: If you modify this table you _MUST_ update the function state_text
@@ -321,6 +354,13 @@ struct conn {
     int    hdrsize;   /* number of headers' worth of space is allocated */
 
     bool   noreply;   /* True if the reply should not be sent. */
+    /* current stats command */
+    struct {
+        char *buffer;
+        size_t size;
+        size_t offset;
+    } stats;
+
     /* Binary protocol stuff */
     /* This is where the binary header goes */
     protocol_binary_request_header binary_header;
@@ -343,10 +383,6 @@ char *do_add_delta(conn *c, item *item, const bool incr, const int64_t delta,
                    char *buf);
 enum store_item_type do_store_item(item *item, int comm, conn* c);
 conn *conn_new(const int sfd, const enum conn_states init_state, const int event_flags, const int read_buffer_size, enum protocol prot, struct event_base *base);
-uint32_t append_bin_stats(char *buf, const char *key, const uint16_t klen,
-                          const char *val, const uint32_t vlen, void *cookie);
-uint32_t append_ascii_stats(char *buf, const char *key, const uint16_t klen,
-                            const char *val, const uint32_t vlen, void *cookie);
 extern int daemonize(int nochdir, int noclose);
 
 
@@ -356,7 +392,7 @@ extern int daemonize(int nochdir, int noclose);
 #include "items.h"
 #include "trace.h"
 #include "hash.h"
-
+#include "util.h"
 
 /*
  * Functions such as the libevent-related calls that need to do cross-thread
@@ -388,12 +424,8 @@ item *item_next(item *it);
 int   item_link(item *it);
 void  item_remove(item *it);
 int   item_replace(item *it, item *new_it);
-char *item_stats(uint32_t (*add_stats)(char *buf, const char *key,
-                 const uint16_t klen, const char *val,
-                 const uint32_t vlen, void *cookie), void *c, int *bytes);
-char *item_stats_sizes(uint32_t (*add_stats)(char *buf,
-                       const char *key, const uint16_t klen, const char *val,
-                       const uint32_t vlen, void *cookie), void *c, int *bytes);
+void  item_stats(ADD_STAT add_stats, void *c);
+void  item_stats_sizes(ADD_STAT add_stats, void *c);
 void  item_unlink(item *it);
 void  item_update(item *it);
 
@@ -402,6 +434,10 @@ void STATS_UNLOCK(void);
 void threadlocal_stats_reset(void);
 void threadlocal_stats_aggregate(struct thread_stats *stats);
 void slab_stats_aggregate(struct thread_stats *stats, struct slab_stats *out);
+
+/* Stat processing functions */
+void append_stat(const char *name, ADD_STAT add_stats, conn *c,
+                 const char *fmt, ...);
 
 enum store_item_type store_item(item *item, int comm, conn *c);
 
