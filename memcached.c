@@ -2566,20 +2566,37 @@ static inline void process_pget_command(conn *c, token_t *tokens, size_t ntokens
     int stats_get_hits[MAX_NUMBER_OF_SLAB_CLASSES];
     bool out_of_memory = false;
 
-    char *key = tokens[KEY_TOKEN].value;
-    int nkey = tokens[KEY_TOKEN].length;
+    char *prefix_key = tokens[1].value;
+    int npkey = tokens[1].length;
 
     errno = 0;
     int max_items = strtoul(tokens[2].value, NULL, 10);
 
-    if(errno != 0 || max_items < 1 || max_items > RGET_MAX_ITEMS || nkey > KEY_MAX_LENGTH) {
+    if(errno != 0 || max_items < 1 || max_items > RGET_MAX_ITEMS || npkey > KEY_MAX_LENGTH) {
         out_string(c, "CLIENT_ERROR bad command line format");
         return;
     }
 
     stats_get_cmds++;
-    item *it = item_rget(key, nkey);
-    if (it && (it->nkey < nkey || (memcmp(ITEM_key(it), key, nkey) != 0))) {
+
+    item *it;
+    if (ntokens == 4) {
+        it = item_rget(prefix_key, npkey);
+    } else {
+        char *resume_key = tokens[3].value;
+        int nrkey = tokens[3].length;
+        if (nrkey > KEY_MAX_LENGTH || memcmp(resume_key, prefix_key, npkey) != 0) {   
+            out_string(c, "CLIENT_ERROR bad command line format");
+            return;
+        }
+        it = item_rget(resume_key, nrkey);
+        if (it && it->nkey == nrkey && memcmp(ITEM_key(it), resume_key, nrkey) == 0) { 
+            item *next = item_next(it); 
+            item_remove(it);
+            it = next;
+        }
+    }
+    if (it && (it->nkey < npkey || memcmp(ITEM_key(it), prefix_key, npkey) != 0)) {
         item_remove(it);
         it = NULL;
     }
@@ -2595,17 +2612,17 @@ static inline void process_pget_command(conn *c, token_t *tokens, size_t ntokens
             }
 
             it = item_next(it);
-            if (it && (it->nkey < nkey || (memcmp(ITEM_key(it), key, nkey) != 0))) {
+            if (it && (it->nkey < npkey || (memcmp(ITEM_key(it), prefix_key, npkey) != 0))) {
                 item_remove(it);
                 break;
             }
         }
     } else {
         if (settings.detail_enabled) {
-            stats_prefix_record_get(key, nkey, false);
+            stats_prefix_record_get(prefix_key, npkey, false);
         }
         stats_get_misses++;
-        MEMCACHED_COMMAND_GET(c->sfd, key, nkey, -1, 0);
+        MEMCACHED_COMMAND_GET(c->sfd, prefix_key, npkey, -1, 0);
     }
 
     end_get_command(c, stats_get_hits, stats_get_cmds, stats_get_misses, return_cas, out_of_memory);
@@ -2924,7 +2941,7 @@ static void process_command(conn *c, char *command) {
         process_get_command(c, tokens, ntokens, false);
 
 #ifdef SKIPLIST
-    } else if (ntokens == 4 && (strcmp(tokens[COMMAND_TOKEN].value, "pget") == 0)) {
+    } else if ((ntokens == 4 || ntokens == 5) && (strcmp(tokens[COMMAND_TOKEN].value, "pget") == 0)) {
 
         process_pget_command(c, tokens, ntokens, false);
 
@@ -2955,7 +2972,7 @@ static void process_command(conn *c, char *command) {
         process_get_command(c, tokens, ntokens, true);
 
 #ifdef SKIPLIST
-    } else if (ntokens == 4 && (strcmp(tokens[COMMAND_TOKEN].value, "pgets") == 0)) {
+    } else if ((ntokens == 4 || ntokens == 5) && (strcmp(tokens[COMMAND_TOKEN].value, "pgets") == 0)) {
 
         process_pget_command(c, tokens, ntokens, true);
 
