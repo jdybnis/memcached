@@ -128,9 +128,7 @@ int assoc_pick_random_levels(void) {
     int zeros = __builtin_ctz(r); /* count trailing zeros */
 #endif//__GNUC__
 
-    int levels = (int)(zeros / 1.5);
-    if (levels == 0)
-        return 1;
+    int levels = (int)(zeros / 1.2) + 1;
     if (levels > s_high_water) {
         levels = ++s_high_water;
     }
@@ -219,7 +217,7 @@ static item *find_preds (item **preds, item **succs, int n, const char *key, con
 }
 
 item *assoc_find_next(const char *key, const size_t nkey) {
-    item *next;
+    item *next = NULL;
     item *ret = find_preds(NULL, &next, 1, key, nkey, dont_unlink);
     if (ret == NULL) {
 #ifdef LOCK_FREE
