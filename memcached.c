@@ -2587,15 +2587,15 @@ static inline void process_pget_command(conn *c, token_t *tokens, size_t ntokens
     if (ntokens == 4) {
         it = item_rget(prefix_key, npkey);
     } else {
-        char *resume_key = tokens[3].value;
+        char *continue_key = tokens[3].value;
         int nrkey = tokens[3].length;
-        if (nrkey > KEY_MAX_LENGTH || memcmp(resume_key, prefix_key, npkey) != 0) {   
+        if (nrkey > KEY_MAX_LENGTH || memcmp(continue_key, prefix_key, npkey) != 0) {
             out_string(c, "CLIENT_ERROR bad command line format");
             return;
         }
-        it = item_rget(resume_key, nrkey);
-        if (it && it->nkey == nrkey && memcmp(ITEM_key(it), resume_key, nrkey) == 0) { 
-            item *next = item_next(it); 
+        it = item_rget(continue_key, nrkey);
+        if (it && it->nkey == nrkey && memcmp(ITEM_key(it), continue_key, nrkey) == 0) {
+            item *next = item_next(it);
             item_remove(it);
             it = next;
         }
