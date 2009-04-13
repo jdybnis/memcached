@@ -90,7 +90,6 @@ static void settings_init(void);
 static void event_handler(const int fd, const short which, void *arg);
 static void conn_close(conn *c);
 static void conn_init(void);
-static void accept_new_conns(const bool do_accept);
 static bool update_event(conn *c, const int new_flags);
 static void complete_nread(conn *c);
 static void process_command(conn *c, char *command);
@@ -1343,15 +1342,23 @@ static void append_ascii_stats(const char *key, const uint16_t klen,
 }
 
 static bool grow_stats_buf(conn *c, size_t needed) {
-    size_t size = c->stats.size - c->stats.offset;
-    size_t nsize = size;
+    size_t nsize = c->stats.size;
+    size_t available = nsize - c->stats.offset;
     bool rv = true;
 
-    while (nsize < needed) {
-        nsize = nsize << 1;
+    /* Special case: No buffer -- need to allocate fresh */
+    if (c->stats.buffer == NULL) {
+        nsize = 1024;
+        available = c->stats.size = c->stats.offset = 0;
     }
 
-    if (nsize > size) {
+    while (needed > available) {
+        assert(nsize > 0);
+        nsize = nsize << 1;
+        available = nsize - c->stats.offset;
+    }
+
+    if (nsize != c->stats.size) {
         char *ptr = realloc(c->stats.buffer, nsize);
         if (ptr) {
             c->stats.buffer = ptr;
@@ -1374,11 +1381,6 @@ static void append_stats(const char *key, const uint16_t klen,
     }
 
     conn *c = (conn*)cookie;
-    if (c->stats.buffer == NULL) {
-        c->stats.buffer = malloc(2048);
-        c->stats.size = 2048;
-        c->stats.offset = 0;
-    }
 
     if (c->protocol == binary_prot) {
         size_t needed = vlen + klen + sizeof(protocol_binary_response_header);
@@ -1393,6 +1395,8 @@ static void append_stats(const char *key, const uint16_t klen,
         }
         append_ascii_stats(key, klen, val, vlen, c);
     }
+
+    assert(c->stats.offset <= c->stats.size);
 }
 
 static void process_bin_stat(conn *c) {
@@ -3310,11 +3314,8 @@ static bool update_event(conn *c, const int new_flags) {
 /*
  * Sets whether we are listening for new connections or not.
  */
-void accept_new_conns(const bool do_accept) {
+void do_accept_new_conns(const bool do_accept) {
     conn *next;
-
-    if (! is_listen_thread())
-        return;
 
     for (next = listen_conn; next; next = next->next) {
         if (do_accept) {
@@ -4221,14 +4222,13 @@ int main (int argc, char **argv) {
           "u:"  /* user identity to run as */
           "P:"  /* save PID in file */
           "f:"  /* factor? */
-          "s:"  /* unix socket */
           "n:"  /* minimum space allocated for key+value+flags */
           "t:"  /* threads */
           "D:"  /* prefix delimiter? */
           "L"   /* Large memory pages */
           "R:"  /* max requests per event */
-          "C"  /* Disable use of CAS */
-          "b:"   /* backlog queue limit */
+          "C"   /* Disable use of CAS */
+          "b:"  /* backlog queue limit */
         ))) {
         switch (c) {
         case 'a':
