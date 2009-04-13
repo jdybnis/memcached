@@ -52,63 +52,55 @@
         <p>This is an experimental fork of memcached based off of Dustin Sallings' master branch. 
         This branch adds prefix and range commands to the protocol. The new commands are <b>pget</b>, 
         <b>pdelete</b> and <b>rget</b>.</p>
-        <p>The cache is implemented with a skiplist instead of the normal hashtable. Even so, its 
-        performance is very close to the standard memcached (see the benchmarks below). Space usage 
-        is also roughly unchanged. Each item in the skiplist uses an average of 3 bytes more than it 
-        would use in the hashtable</p>
+        <p>The main internal difference in this version is that cache is implemented with a 
+        skiplist instead of the normal hashtable. Even so, its performance is very close to 
+        the standard version of memcached (see the benchmarks below). Space usage is also roughly
+        unchanged. Each item in the skiplist uses an average of 3 bytes more than it would use
+        in the hashtable</p>
       </div>
 
       <h2>New Commands</h2>
 
       <pre>pget key_prefix max_items [continue_key]</pre>
-
       <p>pget instructs the server to send back any items that have keys beginning with the key_prefix. The
-      server will send the items in lexographic order by key. max_items is the maximum number of items 
-      that the server will send in response to a single command. max_items cannot be greater than 100.
-      The client can use a continue_key to retrieve more. If the command includes a continue_key then 
-      the server will only send back items that match the key_prefix and are lexographically after the
-      continue_key.</p>
-      <p>If the client issues a pget and the server sends back the maximum number of items, the client 
-      should assume that there might still be other unsent items on the server that match the key_prefix. 
-      The client should issue another pget with the continue_key equal to the key of the last item from 
-      the previous pget, the server will respond with the next batch of items in lexographic order.</p>
+      server will send the items in lexographic key order. max_items is the maximum number of items 
+      that the server will send in response to a single pget command. max_items cannot be greater than 100.
+      The client can issue multiple pget commands that use the continue_key field to retrieve more than the
+      maximum. If a pget command includes a continue_key then the server will only send back items that 
+      lexographically follow after the continue_key.</p>
+      <p>When the server sends back the maximum number of items in response to a pget, then the client 
+      should assume that there are more items on the server that match the key_prefix. The client should
+      issue another pget with the continue_key equal to the key of the last item from the previous pget,
+      the server will respond with the next batch of items following the continue_key in lexographic order.</p>
 
       <pre>pdelete key_prefix</pre>
-
-      <p>pdelete instructs the server to delete all items that have keys beginning in key_prefix.</p>
+      <p>pdelete instructs the server to delete all items that have keys beginning in key_prefix. key_prefix
+      must not be the empty string.</p>
 
       <pre>rget start end start_is_open end_is_open max_items</pre>
-
       <p>rget is the same as in memcachedb. See the memcachedb docs for usage instructions.</p>
 
       <p><i>Note: these commands are not standard and may very well change between versions.</i></p>
 
       <h2>Benchmarks</h2>
       <h3>Setup</h3>
-      <p>The following are benchmarks of memcached-prefix and memcached v1.2.6. The benchmarks were
+      <p>The following are benchmarks of memcached-prefix and memcached v1.3. The benchmarks were
       run on a Core i7 920 w/ 12GB RAM and HT enabled. The client was libmemcached based, running in 
       loopback mode against a multi-threaded server on the same machine.</p>
-      <p>The benchmark starts out by loading items into an empty cache until the cache contains a number
+      <p>Each benchmark run starts out by loading items into an empty cache until it contains the number
       of items determined by the run parameters (the x axis of the graphs below). Then for a period of 10
-      seconds the client issues random commands in the ratio of 90% get to 5% add and 5% delete, and 
-      measures the number of operations completed per second. The reported measurements are averages of
-      multiple runs.</p>
+      seconds the client issues random commands in the ratio of 90% get, to 5% add, to 5% delete, and 
+      measures the number of operations completed per second. The numbers used to build the graphs are
+      averages of multiple runs.</p>
       <h3>Results</h3>
-      <p>The first graph shows that there is a remarkably small decrease in maximum throughput between 
-      the standard version of version of memcached (hashtable based) and memcached-prefix (skiplist 
-      based). With 100 million items in the cache, the maximum throughput of memcached-prefix is still 
-      close to 100,000 ops/sec.</p>
+      <p>The performance measurements show that there is a remarkably small decrease in maximum 
+      throughput between the standard version of version of memcached (hashtable based) and 
+      memcached-prefix (skiplist based). In the worst case tested, with 100 million items in the cache,
+      the maximum throughput of memcached-prefix is still close to 100,000 ops/sec.</p>
       <img src="compare.png">
-      <p>The second graph shows that if the cpu usage is less than 67% (per-core) running the standard 
-      memcached, then memcached-prefix will be able to handle that same load on that same machine. This
-      figure (67%) assumes both that there are 100 million items in the cache and that the client and
-      server are running on the same machine. When there are fewer items in the cache or the network 
-      overhead is higher then that number will be even higher.</p>
-      <img src="compare_cpu.png">
-      <p>Note: The keys and values used in the above benchmarks were all 8 bytes. This made more items
-      fit into the cache than normal, thereby simulating a server with more RAM. The following graph 
-      shows that the results still apply for normal sized keys and values. Using larger keys and values
-      only changes the results by a small constant factor.</p>
+      <p>Note: The keys and values used in the above benchmark were all 8 bytes. This allowed more items
+      to fit in the cache than normal, thereby simulating a server with more RAM. The following graph shows
+      that using larger keys and values only changes the results by a small constant factor.</p>
       <img src="sizes.png">
 
       <h2>Download</h2>
