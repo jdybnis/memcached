@@ -11,7 +11,7 @@
       body {
         margin-top: 1.0em;
         background-color: #cfd5d8;
-        font-family: "helvetica"; 
+        font-family: "helvetica";
         color: #000000;
       }
       #container {
@@ -28,6 +28,7 @@
       .download { float: right; }
       pre { background: #000; color: #fff; padding: 15px;}
       hr { border: 0; width: 80%; border-bottom: 1px solid #aaa}
+      tt { font-size: larger }
       .footer { text-align:center; padding-top:30px; font-style: italic; }
     </style>
 
@@ -52,54 +53,61 @@
         <p>This is an experimental fork off of the memcached 1.3 development branch. It adds commands
         <b>pget</b> and <b>pdelete</b> that operate on ranges of keys having a common prefix. It also
         adds a memcachedb compatible <b>rget</b> command.</p>
-        <p>The main internal change in this version is that cache is implemented with a skiplist 
-        instead of the normal hashtable. Even so, its performance is very close to the standard 
+        <p>The main internal change in this version is that cache is implemented with a skiplist
+        instead of the normal hashtable. Even so, its performance is very close to the standard
         memcached (see the benchmarks below). Space usage is also roughly unchanged.  Each item in
         the skiplist uses an average of 3 bytes more than it would use in the hashtable</p>
       </div>
 
-      <h2>New Commands</h2>
+      <h2>New Protocol Commands</h2>
 
       <pre>pget key_prefix max_items [continue_key]</pre>
-      <p>pget instructs the server to send back any items that have keys beginning with the key_prefix. The
-      server will send the items in lexographic key order. max_items is the maximum number of items 
-      that the server will send in response to a single pget command. max_items cannot be greater than 100.
-      The client can issue multiple pget commands that use the continue_key field to retrieve more than the
-      maximum. If a pget command includes a continue_key then the server will only send back items that 
-      lexographically follow after the continue_key.</p>
-      <p>When the server sends back the maximum number of items in response to a pget, then the client 
-      should assume that there are more items on the server that match the key_prefix. The client should
-      issue another pget with the continue_key equal to the key of the last item from the previous pget,
-      the server will respond with the next batch of items following the continue_key in lexographic order.</p>
+      <p><tt>pget</tt> instructs the server to send back all the items that have keys beginning with the 
+      specified <tt>key_prefix</tt>. The server will send the items in lexographic key order. <tt>max_items</tt>
+      is the maximum number of items that the server will send in response to a single <tt>pget</tt> command. 
+      <tt>max_items</tt> cannot be greater than 100. To retrieve more than <tt>max_items</tt> the client can 
+      issue multiple <tt>pget</tt> commands with <tt>continue_keys</tt>.</p>
+      <p>If a <tt>pget</tt> command includes a <tt>continue_key</tt> then the server will only send back items 
+      that lexographically follow after the <tt>continue_key</tt>.</p>
+      <p>When the server sends back a number of items equal to <tt>max_items</tt> in response to a <tt>pget</tt>,
+      then the client should assume that there are more items on the server that match the <tt>key_prefix</tt>. 
+      The client should remember the key of the last item returned, and issue another <tt>pget</tt> with that key
+      as the <tt>continue_key</tt>. The server will respond with the next batch of items following the 
+      <tt>continue_key</tt> in lexographic order.</p>
 
       <pre>pdelete key_prefix</pre>
-      <p>pdelete instructs the server to delete all items that have keys beginning in key_prefix. key_prefix
-      must not be the empty string.</p>
+      <p><tt>pdelete</tt> instructs the server to delete all items that have keys beginning in <tt>key_prefix</tt>.
+      <tt>key_prefix</tt> must not be the empty string. Use the flush command instead if you wish to delete all the
+      items in the cache.</p>
 
-      <pre>rget start end start_is_open end_is_open max_items</pre>
-      <p>rget is the same as in memcachedb. See the memcachedb docs for usage instructions.</p>
+      <pre>rget start end start_is_open end_is_open <tt>max_items</tt></pre>
+      <p><tt>rget</tt> is the same as the command in memcachedb. See the memcachedb protocol documentation for
+      usage instructions.</p>
 
       <p><i>Note: these commands are not standard and may very well change between versions.</i></p>
 
       <h2>Benchmarks</h2>
+      <p>The following measurments compare the performance of memcached-prefix and the standard
+      memcached v1.3.</p>
       <h3>Setup</h3>
-      <p>The following are benchmarks of memcached-prefix and memcached v1.3. The benchmarks were
-      run on a Core i7 920 w/ 12GB RAM and HT enabled. The client was libmemcached based, running in 
-      loopback mode against a multi-threaded server on the same machine.</p>
-      <p>Each benchmark run starts out by loading items into an empty cache until it contains the number
-      of items determined by the run parameters (the x axis of the graphs below). Then for a period of 10
-      seconds the client issues random commands in the ratio of 90% get, to 5% add, to 5% delete, and 
-      measures the number of operations completed per second. The numbers used to build the graphs are
-      averages of multiple runs.</p>
+      <p>The benchmarks were run on a Core i7 920 w/ 12GB RAM and HT enabled. The client was libmemcached
+      based, running in loopback mode against a multi-threaded server on the same machine.</p>
+      <p>Each benchmark run starts out by loading items into an empty cache until it contains a specific
+      number of items (the x axis of the graphs below). Then for a period of 10 seconds the client issues
+      random commands in the ratio of 90% get, to 5% add, to 5% delete, and measures the number of
+      operations completed per second. The numbers used to build the graphs are averages of multiple
+      runs.</p>
       <h3>Results</h3>
-      <p>The performance measurements show that there is a remarkably small decrease in maximum 
-      throughput between the standard version of version of memcached (hashtable based) and 
-      memcached-prefix (skiplist based). In the worst case tested, with 100 million items in the cache,
-      the maximum throughput of memcached-prefix is still close to 100,000 ops/sec.</p>
+      <p>The performance measurements show that there is a remarkably small decrease in throughput
+      between the standard version of memcached (hashtable based) and memcached-prefix (skiplist
+      based). Although the skiplist based version drops in throughput slightly more than the
+      standard hashtable version as the number of items in the cache increases, <b>the throughput
+      of memcached-prefix is still close to 100,000 ops/sec, in the worst case tested, with 100
+      million items in the cache</b>.</p>
       <img src="compare.png">
       <p>Note: The keys and values used in the above benchmark were all 8 bytes. This allowed more items
-      to fit in the cache than normal, thereby simulating a server with more RAM. The following graph shows
-      that using larger keys and values only changes the results by a small constant factor.</p>
+      to fit in the cache than normal, thereby simulating a server with much more RAM. The following
+      graph shows that using larger keys and values only changes the results by a small constant factor.</p>
       <img src="sizes.png">
 
       <h2>Download</h2>
