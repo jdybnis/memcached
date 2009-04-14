@@ -53,36 +53,37 @@
         <p>This is an experimental fork off of the memcached 1.3 development branch. It adds commands
         <b>pget</b> and <b>pdelete</b> that operate on ranges of keys having a common prefix. It also
         adds a memcachedb compatible <b>rget</b> command.</p>
-        <p>The main internal change in this version is that cache is implemented with a skiplist
-        instead of the normal hashtable. Even so, its performance is very close to the standard
-        memcached (see the benchmarks below). Space usage is also roughly unchanged.  Each item in
-        the skiplist uses an average of 3 bytes more than it would use in the hashtable</p>
+        <p>The main internal change is that the cache is implemented with a skiplist instead of the
+        normal hashtable. Even so, its performance is very close to the standard memcached (see the
+        benchmarks below). Space usage is also roughly unchanged.  Each item in the skiplist has
+        an average of 4 bytes more overhead than it would in the hashtable.</p>
       </div>
 
       <h2>New Protocol Commands</h2>
-
-      <pre>pget key_prefix max_items [continue_key]</pre>
-      <p><tt>pget</tt> instructs the server to send back all the items that have keys beginning with the 
-      specified <tt>key_prefix</tt>. The server will send the items in lexographic key order. <tt>max_items</tt>
-      is the maximum number of items that the server will send in response to a single <tt>pget</tt> command. 
-      <tt>max_items</tt> cannot be greater than 100. To retrieve more than <tt>max_items</tt> the client can 
-      issue multiple <tt>pget</tt> commands with <tt>continue_keys</tt>.</p>
-      <p>If a <tt>pget</tt> command includes a <tt>continue_key</tt> then the server will only send back items 
-      that lexographically follow after the <tt>continue_key</tt>.</p>
-      <p>When the server sends back a number of items equal to <tt>max_items</tt> in response to a <tt>pget</tt>,
-      then the client should assume that there are more items on the server that match the <tt>key_prefix</tt>. 
-      The client should remember the key of the last item returned, and issue another <tt>pget</tt> with that key
-      as the <tt>continue_key</tt>. The server will respond with the next batch of items following the 
-      <tt>continue_key</tt> in lexographic order.</p>
 
       <pre>pdelete key_prefix</pre>
       <p><tt>pdelete</tt> instructs the server to delete all items that have keys beginning in <tt>key_prefix</tt>.
       <tt>key_prefix</tt> must not be the empty string. Use the flush command instead if you wish to delete all the
       items in the cache.</p>
 
+      <pre>pget key_prefix max_items [continue_key]</pre>
+      <p><tt>pget</tt> instructs the server to send all the items that have keys beginning with the 
+      specified <tt>key_prefix</tt>. The server will send the items in lexographic key order. <tt>max_items</tt>
+      is the maximum number of items that the server will send in response to a single <tt>pget</tt> command. 
+      <tt>max_items</tt> cannot be greater than 100. To retrieve more than <tt>max_items</tt> the client can 
+      issue multiple <tt>pget</tt> commands that use the <tt>continue_key</tt>.</p>
+      <p>If a <tt>pget</tt> command includes a <tt>continue_key</tt> then the server will only send back items 
+      that lexographically follow after the <tt>continue_key</tt>.</p>
+      <p>When the server sends back a number of items equal to <tt>max_items</tt>, then the client should assume
+      that there are more items on the server matching the <tt>key_prefix</tt>. To retreive the remaining items
+      the client should remember the key of the last item it received and issue another <tt>pget</tt> with that
+      key as the <tt>continue_key</tt>. The server will respond with the next batch of items following the 
+      <tt>continue_key</tt> in lexographic order.</p>
+
       <pre>rget start end start_is_open end_is_open <tt>max_items</tt></pre>
-      <p><tt>rget</tt> is the same as the command in memcachedb. See the memcachedb protocol documentation for
-      usage instructions.</p>
+      <p><tt>rget</tt> is the same as the command in memcachedb. See the 
+      <a href="http://memcachedb.googlecode.com/svn/trunk/doc/rget.txt">memcachedb documentation</a>
+      for usage instructions.</p>
 
       <p><i>Note: these commands are not standard and may very well change between versions.</i></p>
 
@@ -105,9 +106,9 @@
       of memcached-prefix is still close to 100,000 ops/sec, in the worst case tested, with 100
       million items in the cache</b>.</p>
       <img src="compare.png">
-      <p>Note: The keys and values used in the above benchmark were all 8 bytes. This allowed more items
-      to fit in the cache than normal, thereby simulating a server with much more RAM. The following
-      graph shows that using larger keys and values only changes the results by a small constant factor.</p>
+      <p>Note: The keys and values used in the above benchmark were all 8 bytes to allow more items to 
+      fit in the cache than normal, thereby simulating a server with much more RAM. The following graph
+      shows that using larger keys and values only changes the results by a small constant factor.</p>
       <img src="sizes.png">
 
       <h2>Download</h2>
@@ -122,7 +123,7 @@
       </div>
 
       <h2>Contact</h2>
-      <p>Josh Dybnis (jdybnis@gmail.com)</p>
+      <p>Josh Dybnis (fist letter of firstname followed by entire lastname, at gmail.com)</p>
 
     </div>
 
