@@ -103,8 +103,8 @@
       between the standard version of memcached (hashtable based) and memcached-prefix (skiplist
       based). Although the skiplist based version drops in throughput slightly more than the
       standard hashtable version as the number of items in the cache increases, <b>the throughput
-      of memcached-prefix is still close to 100,000 ops/sec, in the worst case tested, with 100
-      million items in the cache</b>.</p>
+      of memcached-prefix is close to 100,000 ops/sec, in the worst case tested, with 100 million
+      items in the cache</b>.</p>
       <img src="compare.png">
       <p>Note: The keys and values used in the above benchmark were all 8 bytes to allow more items to 
       fit in the cache than normal, thereby simulating a server with much more RAM. The following graph
